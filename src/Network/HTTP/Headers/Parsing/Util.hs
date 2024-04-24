@@ -1,3 +1,5 @@
+{-# LANGUAGE DeriveLift #-}
+{-# LANGUAGE MagicHash #-}
 {-# LANGUAGE TemplateHaskell #-}
 module Network.HTTP.Headers.Parsing.Util 
   ( module Network.HTTP.Headers.Parsing.Util
@@ -16,12 +18,16 @@ import Data.CharSet.Posix.Ascii
 import Data.Fixed
 import Data.Int
 import Data.List.NonEmpty (NonEmpty)
+import Data.Maybe
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
 import qualified Data.Text.Short as ST
 import qualified Data.Text.Short.Unsafe as STU
 import FlatParse.Basic
+import FlatParse.Basic.Base
+import Language.Haskell.TH
+import Language.Haskell.TH.Syntax (Lift(..))
 
 optionalWhitespace :: ParserT st e ()
 optionalWhitespace = ows
@@ -128,48 +134,69 @@ rfc8941InnerList p = do
 {-# INLINE rfc8941InnerList #-}
 
 data ItemValue
-  = Integer !Int64
+  = Integer !Int
   | Decimal !Milli
-  | String !ST.ShortText
-  | Token !ST.ShortText
+  | String !RFC8941String
+  | Token !RFC8941Token
   | Binary !ByteString
   | Boolean !Bool
   deriving stock (Eq, Show)
 
 data ItemValueType t where
-  ItemInteger :: ItemValueType Int64
+  ItemInteger :: ItemValueType Int
   ItemDecimal :: ItemValueType Milli
-  ItemString :: ItemValueType ST.ShortText
-  ItemToken :: ItemValueType ST.ShortText
+  ItemString :: ItemValueType RFC8941String
+  ItemToken :: ItemValueType RFC8941Token
   ItemBinary :: ItemValueType ByteString
   ItemBoolean :: ItemValueType Bool
-  ItemOneOf :: NonEmpty (ItemValueType t) -> ItemValueType t
   ItemAny :: ItemValueType ItemValue
 
-rfc8941Integer :: ParserT st e Int64
+instance Lift (ItemValueType t) where
+  lift ItemInteger = [| ItemInteger |]
+  lift ItemDecimal = [| ItemDecimal |]
+  lift ItemString = [| ItemString |]
+  lift ItemToken = [| ItemToken |]
+  lift ItemBinary = [| ItemBinary |]
+  lift ItemBoolean = [| ItemBoolean |]
+  lift ItemAny = [| ItemAny |]
+
+rfc8941Integer :: ParserT st e Int
 rfc8941Integer = do
-  sign <- ($(char '-') *> pure negate) <|> pure id
-  res <- isolate 15 anyAsciiDecimalWord
-  pure $ sign $ fromIntegral res
+  baseVal `notFollowedBy` $(char '.')
+  where
+    baseVal = do
+      sign <- ($(char '-') *> pure negate) <|> pure id
+      res <- anyAsciiDecimalWord
+      pure $ sign $ fromIntegral res
 {-# INLINE rfc8941Integer #-}
 
-rfc8941Decimal :: ParserT st e Milli
+rfc8941Decimal :: ParserT st String Milli
 rfc8941Decimal = do
-  sign <- ($(char '-') *> pure negate) <|> pure id
-  decimalPart <- isolate 12 anyAsciiDecimalInteger
-  $(char '.')
-  withSpan (isolate 3 anyAsciiDecimalInteger) $ \fractionalPart (Span (Pos start) (Pos end)) -> do
-    let fractionalPart' = case end - start of
-          1 -> fractionalPart * 100
-          2 -> fractionalPart * 10
-          3 -> fractionalPart
-          _ -> error "Impossible"
-    pure $ MkFixed $ sign (decimalPart * 1000 + fractionalPart')
+  sign <- branch $(char '-') (pure negate) (pure id)
+  decimalPart <- anyAsciiDecimalInteger
+  fracPart <- branch $(char '.') 
+    ( do
+      startingZeros <- length <$> many (satisfyAscii (== '0'))
+      withOption 
+        anyAsciiDecimalInteger
+        (\fractionalPart -> pure (fractionalPart * 10 ^ negate startingZeros))
+        (pure 0)
+    )
+    (pure 0)
+  pure $ MkFixed $ sign (decimalPart * 1000 + fracPart)
 {-# INLINE rfc8941Decimal #-}
 
-rfc8941Token :: ParserT st e ST.ShortText
+newtype RFC8941Token = RFC8941Token { unsafeToRFC8941Token :: ST.ShortText }
+  deriving stock (Eq, Show)
+
+mkRFC8941Token :: ST.ShortText -> Maybe RFC8941Token
+mkRFC8941Token t = case runParser rfc8941Token (ST.toByteString t) of
+  OK x "" -> Just x
+  _ -> Nothing
+
+rfc8941Token :: ParserT st e RFC8941Token
 rfc8941Token = withByteString tokenParser $ \_ bs -> do
-  pure $! STU.fromByteStringUnsafe bs
+  pure $ RFC8941Token $! STU.fromByteStringUnsafe bs
   where
     tokenParser = do
       skipSatisfyAscii (\c -> c == '*' || c `CharSet.member` alpha)
@@ -194,9 +221,17 @@ rfc8941Binary = do
     base64CharSet = alpha <> digit <> "+/="
 {-# INLINE rfc8941Binary #-}
 
-rfc8941String :: ParserT st e ST.ShortText
-rfc8941String = quotedString
+newtype RFC8941String = RFC8941String { unsafeToRFC8941String :: ST.ShortText }
+  deriving stock (Eq, Show)
+
+rfc8941String :: ParserT st e RFC8941String
+rfc8941String = RFC8941String <$> quotedString
 {-# INLINE rfc8941String #-}
+
+mkRFC8941String :: ST.ShortText -> Maybe RFC8941String
+mkRFC8941String t = if ST.all (`CharSet.member` (quotedCharSet <> quotedPairCharSet)) t
+  then Just $ RFC8941String t
+  else Nothing
 
 rfc8941ItemValue :: ParserT st String ItemValue
 rfc8941ItemValue = asum
@@ -216,11 +251,10 @@ itemValueTypeParser ItemToken = rfc8941Token
 itemValueTypeParser ItemBinary = rfc8941Binary
 itemValueTypeParser ItemBoolean = rfc8941Boolean
 itemValueTypeParser ItemAny = rfc8941ItemValue
-itemValueTypeParser (ItemOneOf items) = asum $ fmap itemValueTypeParser items
 {-# INLINE itemValueTypeParser #-}
 
-rfc8941Parameter :: ItemValueType t -> ParserT st String (ST.ShortText, Maybe t)
-rfc8941Parameter t = do
+anyRfc8941Parameter :: ItemValueType t -> ParserT st String (ST.ShortText, Maybe t)
+anyRfc8941Parameter t = do
   $(char ';')
   ows
   key <- paramKey
@@ -235,8 +269,54 @@ rfc8941Parameter t = do
     keyChar = lcalpha <> digit <> "_-.*"
     paramKey = withByteString (skipSatisfyAscii (`CharSet.member` firstKeyChar) *> skipMany (skipSatisfyAscii (`CharSet.member` keyChar))) $ \_ bs -> do
       pure $ STU.fromByteStringUnsafe bs
-{-# INLINE rfc8941Parameter #-}
+{-# INLINE anyRfc8941Parameter #-}
+
+knownRfc8941Parameter :: Q Exp -> ItemValueType t -> Q Exp -- ParserT st String (Maybe t)
+knownRfc8941Parameter k t = do
+  [| do
+    $(char ';')
+    ows
+    key <- $(k)
+    paramValue <- optional $ do
+      $(char '=')
+      itemValueTypeParser t
+    pure paramValue |]
+  where
+    lcalpha = CharSet.fromList ['a'..'z']
+    star = CharSet.singleton '*'
+    firstKeyChar = lcalpha <> star
+    keyChar = lcalpha <> digit <> "_-.*"
+    paramKey = withByteString (skipSatisfyAscii (`CharSet.member` firstKeyChar) *> skipMany (skipSatisfyAscii (`CharSet.member` keyChar))) $ \_ bs -> do
+      pure $ STU.fromByteStringUnsafe bs
+{-# INLINE knownRfc8941Parameter #-}
+
+knownRfc8941WithRequiredKeyParser :: Q Exp -> Q Exp -> Q Exp -- ParserT st String (Maybe t)
+knownRfc8941WithRequiredKeyParser k t = do
+  [| do
+    $(char ';')
+    ows
+    key <- $(k)
+    $(char '=')
+    $(t) |]
+{-# INLINE knownRfc8941WithRequiredKeyParser #-}
+
+knownRfc8941WithNoValueParser :: Q Exp -> Q Exp -- ParserT st String (Maybe t)
+knownRfc8941WithNoValueParser k = do
+  [| do
+    $(char ';')
+    ows
+    $(k) |]
+{-# INLINE knownRfc8941WithNoValueParser #-}
 
 rfc8941Parameters :: ParserT st String [(ST.ShortText, Maybe ItemValue)]
-rfc8941Parameters = many (rfc8941Parameter ItemAny)
+rfc8941Parameters = many (anyRfc8941Parameter ItemAny)
 {-# INLINE rfc8941Parameters #-}
+
+-- | Run the parser, if an error is thrown, handle it with the given function.
+embedError :: ParserT st e b -> (e -> ParserT st e' b) -> ParserT st e' b
+embedError (ParserT f) hdl = ParserT $ \fp eob s st -> case f fp eob s st of
+  Err# st' e -> case hdl e of
+    ParserT g -> g fp eob s st'
+  OK# st' x a -> OK# st' x a
+  Fail# st' -> Fail# st'
+{-# inline embedError #-}

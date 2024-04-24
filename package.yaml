@@ -27,6 +27,7 @@ default-extensions:
 - GADTs
 - GeneralizedNewtypeDeriving
 - LambdaCase
+- NumericUnderscores
 - OverloadedStrings
 - RankNTypes
 - ScopedTypeVariables
@@ -40,6 +41,7 @@ dependencies:
 - parser-combinators
 - bytestring
 - case-insensitive
+- containers
 - foldl
 - http-types
 - hashable
@@ -49,10 +51,12 @@ dependencies:
 - MonadRandom
 - unordered-containers
 - validation
+- template-haskell
 - text
 - text-short
 - time
 - transformers
+- validation
 - vector
 
 ghc-options:

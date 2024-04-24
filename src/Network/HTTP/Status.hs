@@ -65,9 +65,9 @@ module Network.HTTP.Status
   ) where
 
 import Data.Hashable (Hashable)
-import Data.Word (Word8)
+import Data.Word (Word16)
 
-newtype StatusCode = StatusCode { statusCode :: Word8 }
+newtype StatusCode = StatusCode { statusCode :: Word16 }
   deriving stock (Eq, Ord)
   deriving newtype (Hashable)
 

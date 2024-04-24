@@ -26,12 +26,16 @@ source-repository head
 library
   exposed-modules:
       Data.Array.Byte.Hash
+      Network.HTTP.ContentCoding
       Network.HTTP.ContentNegotiation
       Network.HTTP.Headers
       Network.HTTP.Headers.Accept
+      Network.HTTP.Headers.AcceptEncoding
       Network.HTTP.Headers.Age
       Network.HTTP.Headers.CacheControl
       Network.HTTP.Headers.CacheStatus
+      Network.HTTP.Headers.ContentEncoding
+      Network.HTTP.Headers.ContentLength
       Network.HTTP.Headers.Date
       Network.HTTP.Headers.ETag
       Network.HTTP.Headers.Expires
@@ -43,7 +47,12 @@ library
       Network.HTTP.Headers.IfUnmodifiedSince
       Network.HTTP.Headers.LastModified
       Network.HTTP.Headers.Parsing.Util
+      Network.HTTP.Headers.PingFrom
+      Network.HTTP.Headers.PingTo
       Network.HTTP.Headers.Rendering.Util
+      Network.HTTP.Headers.RetryAfter
+      Network.HTTP.Headers.Server
+      Network.HTTP.Headers.Sunset
       Network.HTTP.Headers.UserAgent
       Network.HTTP.Headers.Vary
       Network.HTTP.Methods
@@ -69,6 +78,7 @@ library
       GADTs
       GeneralizedNewtypeDeriving
       LambdaCase
+      NumericUnderscores
       OverloadedStrings
       RankNTypes
       ScopedTypeVariables
@@ -81,6 +91,7 @@ library
     , bytestring
     , case-insensitive
     , charset
+    , containers
     , flatparse
     , foldl
     , hashable
@@ -89,6 +100,7 @@ library
     , mason
     , memory
     , parser-combinators
+    , template-haskell
     , text
     , text-short
     , time
@@ -104,9 +116,12 @@ test-suite hermes-test
   other-modules:
       Network.HTTP.Headers.AgeSpec
       Network.HTTP.Headers.CacheControlSpec
+      Network.HTTP.Headers.CacheStatusSpec
       Network.HTTP.Headers.DateSpec
       Network.HTTP.Headers.ETagSpec
+      Network.HTTP.Headers.ItemValueSpec
       Network.HTTP.Headers.VarySpec
+      RFC8941
       Paths_hermes
   autogen-modules:
       Paths_hermes
@@ -120,6 +135,7 @@ test-suite hermes-test
       GADTs
       GeneralizedNewtypeDeriving
       LambdaCase
+      NumericUnderscores
       OverloadedStrings
       RankNTypes
       ScopedTypeVariables
@@ -132,6 +148,7 @@ test-suite hermes-test
     , bytestring
     , case-insensitive
     , charset
+    , containers
     , flatparse
     , foldl
     , hashable
@@ -145,6 +162,7 @@ test-suite hermes-test
     , mason
     , memory
     , parser-combinators
+    , template-haskell
     , text
     , text-short
     , time
@@ -171,6 +189,7 @@ benchmark hermes-bench
       GADTs
       GeneralizedNewtypeDeriving
       LambdaCase
+      NumericUnderscores
       OverloadedStrings
       RankNTypes
       ScopedTypeVariables
@@ -183,6 +202,7 @@ benchmark hermes-bench
     , bytestring
     , case-insensitive
     , charset
+    , containers
     , criterion
     , flatparse
     , foldl
@@ -193,6 +213,7 @@ benchmark hermes-bench
     , mason
     , memory
     , parser-combinators
+    , template-haskell
     , text
     , text-short
     , time
