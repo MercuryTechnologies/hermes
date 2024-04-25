@@ -32,6 +32,7 @@ library
       Network.HTTP.Headers.Accept
       Network.HTTP.Headers.AcceptEncoding
       Network.HTTP.Headers.Age
+      Network.HTTP.Headers.Authorization
       Network.HTTP.Headers.CacheControl
       Network.HTTP.Headers.CacheStatus
       Network.HTTP.Headers.ContentEncoding
@@ -115,6 +116,7 @@ test-suite hermes-test
   main-is: Spec.hs
   other-modules:
       Network.HTTP.Headers.AgeSpec
+      Network.HTTP.Headers.AuthorizationSpec
       Network.HTTP.Headers.CacheControlSpec
       Network.HTTP.Headers.CacheStatusSpec
       Network.HTTP.Headers.DateSpec

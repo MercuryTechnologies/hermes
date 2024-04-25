@@ -60,7 +60,8 @@ Server Response: The server either confirms the resource hasn't changed (with a 
 This system, while complex, enables efficient, flexible, and scalable web content delivery, minimizing unnecessary data transfers while ensuring users receive up-to-date content.
 -}
 module Network.HTTP.Headers.CacheControl 
-  ( CacheControlDirective(..)
+  ( CacheControl(..)
+  , CacheControlDirective(..)
   -- * Cache control header parsing and validation
   , UsableDirectives(..)
   , usableRequestDirectives

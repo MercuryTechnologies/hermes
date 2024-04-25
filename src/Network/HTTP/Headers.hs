@@ -43,8 +43,8 @@ data HeaderMap = HeaderMap
 lookupRawHeader :: HeaderFieldName -> HeaderMap -> Maybe (NonEmpty BS.ByteString)
 lookupRawHeader name (HeaderMap m) = fmap NE.reverse $ name `Map.lookup` m
 
-lookupHeader :: KnownHeader a => HeaderFieldName -> HeaderMap -> Either (ParseFailure a) (Maybe a)
-lookupHeader name m = case lookupRawHeader name m of
+lookupHeader :: forall a. KnownHeader a => HeaderMap -> Either (ParseFailure a) (Maybe a)
+lookupHeader m = case lookupRawHeader (headerName $ Proxy @a) m of
   Nothing -> Right Nothing
   Just entries -> case parseFromHeaders defaultHeaderSettings (NE.reverse entries) of
     Left e -> Left e

@@ -8,6 +8,7 @@ module Network.HTTP.Headers.Parsing.Util
 
 import Control.Applicative (asum)
 import Control.Monad.Combinators hiding (skipMany, skipSome, some, many, (<|>), optional)
+import qualified Control.Monad.Combinators.NonEmpty as NE
 import Data.ByteArray.Encoding
 import Data.ByteString (ByteString)
 import Data.ByteString.Short (ShortByteString, toShort)
@@ -36,13 +37,22 @@ optionalWhitespace = ows
 isOWS :: Char -> Bool
 isOWS c = c == ' ' || c == '\t'
 
+-- | Optional whitespace (space or tab).
 ows :: ParserT st e ()
 ows = skipMany (skipSatisfyAscii isOWS)
 {-# INLINE ows #-}
 
-ows1 :: ParserT st e ()
-ows1 = skipSome (skipSatisfyAscii isOWS)
-{-# INLINE ows1 #-}
+-- | Required whitespace (space or tab).
+rws :: ParserT st e ()
+rws = skipSome (skipSatisfyAscii isOWS)
+{-# INLINE rws #-}
+
+-- | "Bad whitespace" (space or tab).
+--
+-- Used where a grammar allows optional whitespace, but only for historical reasons.
+bws :: ParserT st e ()
+bws = ows
+{-# INLINE bws #-}
 
 shortASCIIFromParser_ :: ParserT st e a -> ParserT st e ST.ShortText
 shortASCIIFromParser_ p = withByteString p $ \_res s -> pure $ STU.fromByteStringUnsafe s
@@ -123,11 +133,15 @@ rfc8941List :: ParserT st e a -> ParserT st e [a]
 rfc8941List p = p `sepBy` (ows *> $(char ',') *> ows)
 {-# INLINE rfc8941List #-}
 
-rfc8941InnerList :: ParserT st e a -> ParserT st e [a]
+rfc8941List1 :: ParserT st e a -> ParserT st e (NonEmpty a)
+rfc8941List1 p = p `NE.sepBy1` (ows *> $(char ',') *> ows)
+{-# INLINE rfc8941List1 #-}
+
+rfc8941InnerList :: ParserT st e a -> ParserT st e (NonEmpty a)
 rfc8941InnerList p = do
   $(char '(')
   ows
-  res <- p `sepBy1` ows1
+  res <- p `NE.sepBy1` rws
   ows
   $(char ')')
   pure res
