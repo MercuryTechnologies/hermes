@@ -6,9 +6,11 @@ import Data.Text.Short (ShortText)
 import Data.CharSet (CharSet)
 import qualified Data.CharSet as CharSet
 import qualified Data.List.NonEmpty as NE
+import Data.Maybe (fromMaybe)
+import Data.String
 import FlatParse.Basic
 import Network.HTTP.Headers.Parsing.Util 
-import Network.HTTP.Headers.Rendering.Util
+import qualified Network.HTTP.Headers.Rendering.Util as R
 import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName
 import qualified Mason.Builder as M
@@ -16,9 +18,27 @@ import qualified Mason.Builder as M
 newtype AuthScheme = AuthScheme ShortText
   deriving stock (Eq, Show)
 
+data CredentialParam
+  = CredentialParamToken {-# UNPACK #-} !ShortText
+  | CredentialParamString {-# UNPACK #-} !RFC8941String
+  deriving stock (Show)
+
+instance Eq CredentialParam where
+  CredentialParamToken a == CredentialParamToken b = a == b
+  CredentialParamString a == CredentialParamString b = a == b
+  CredentialParamString a == CredentialParamToken b = unsafeToRFC8941String a == b
+  _ == _ = False
+
+instance IsString CredentialParam where
+  fromString str = case runParser rfc9110Token $ fromString str of
+    OK token "" -> CredentialParamToken token
+    _ -> case mkRFC8941String $ fromString str of
+      Just s -> CredentialParamString s
+      Nothing -> error "Failed to parse string as RFC8941String"
+
 data CredentialContents
   = CredentialToken ByteString
-  | CredentialParams (NE.NonEmpty (ShortText, ShortText))
+  | CredentialParams (NE.NonEmpty (ShortText, CredentialParam))
   deriving stock (Eq, Show)
 
 data Credentials = Credentials
@@ -42,7 +62,7 @@ credentialsParser = do
       bws
       $(char '=')
       bws
-      val <- quotedString <|> rfc9110Token
+      val <- (CredentialParamString <$> rfc8941String) <|> (CredentialParamToken <$> rfc9110Token)
       pure (key, val)
     rfc7230Token68Parser = byteStringOf (skipSome $ skipSatisfyAscii (`CharSet.member` token68Chars))
       where
@@ -50,10 +70,14 @@ credentialsParser = do
 
 renderCredentials :: Credentials -> M.Builder
 renderCredentials = \case
-  Credentials (AuthScheme scheme) (CredentialToken token) -> shortText scheme <> M.char7 ' ' <> M.byteString token
-  Credentials (AuthScheme scheme) (CredentialParams params) -> shortText scheme <> M.char7 ' ' <> M.intersperse (M.char7 ',') (NE.toList $ fmap renderParam params)
+  Credentials (AuthScheme scheme) (CredentialToken token) -> R.shortText scheme <> M.char7 ' ' <> M.byteString token
+  Credentials (AuthScheme scheme) (CredentialParams params) -> R.shortText scheme <> M.char7 ' ' <> M.intersperse (M.char7 ',') (NE.toList $ fmap renderParam params)
   where
-    renderParam (key, val) = shortText key <> M.char7 '=' <> shortText val
+    renderParam (key, val) = R.shortText key <> M.char7 '=' <>
+      (case val of
+        CredentialParamToken token -> R.shortText token
+        CredentialParamString str -> R.rfc8941String str
+      )
 
 newtype Authorization = Authorization { authorizationCredentials :: Credentials }
   deriving stock (Eq, Show)
