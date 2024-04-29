@@ -6,7 +6,7 @@ import Data.Text.Short (ShortText)
 import Data.Time.Clock (UTCTime)
 import qualified Mason.Builder as M
 import Network.HTTP.ContentCoding
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hContentEncoding)
 import Network.HTTP.Headers.Parsing.Util
@@ -18,6 +18,8 @@ newtype ContentEncoding = ContentEncoding
 
 instance KnownHeader ContentEncoding where
   type ParseFailure ContentEncoding = String
+  type Cardinality ContentEncoding = 'ZeroOrOne
+  type Direction ContentEncoding = 'Response
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -27,7 +29,7 @@ instance KnownHeader ContentEncoding where
       Fail -> Left "Failed to parse Content-Encoding header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderContentEncoding
+  renderToHeaders _ = M.toStrictByteString . renderContentEncoding
 
   headerName _ = hContentEncoding
 

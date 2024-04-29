@@ -48,6 +48,7 @@ dependencies:
 - intern
 - mason
 - memory
+- mono-traversable
 - MonadRandom
 - unordered-containers
 - validation

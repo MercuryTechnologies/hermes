@@ -11,7 +11,7 @@ import Data.Word (Word64, Word32)
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hAge)
 import Network.HTTP.Headers.Parsing.Util
@@ -21,6 +21,8 @@ newtype Age = Age { age :: Word32 }
 
 instance KnownHeader Age where
   type ParseFailure Age = String
+  type Cardinality Age = 'ZeroOrOne
+  type Direction Age = 'Response
 
   parseFromHeaders _ headers = case runParser parseAge $ NE.head headers of
     OK age "" -> Right age
@@ -28,7 +30,7 @@ instance KnownHeader Age where
     Fail -> Left "Failed to parse Age header"
     Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderAge
+  renderToHeaders _ = M.toStrictByteString . renderAge
 
   headerName _ = hAge
 

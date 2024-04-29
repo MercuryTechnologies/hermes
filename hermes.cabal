@@ -50,9 +50,11 @@ library
       Network.HTTP.Headers.Parsing.Util
       Network.HTTP.Headers.PingFrom
       Network.HTTP.Headers.PingTo
+      Network.HTTP.Headers.ProxyAuthorization
       Network.HTTP.Headers.Rendering.Util
       Network.HTTP.Headers.RetryAfter
       Network.HTTP.Headers.Server
+      Network.HTTP.Headers.Settings
       Network.HTTP.Headers.Sunset
       Network.HTTP.Headers.UserAgent
       Network.HTTP.Headers.Vary
@@ -100,6 +102,7 @@ library
     , intern
     , mason
     , memory
+    , mono-traversable
     , parser-combinators
     , template-haskell
     , text
@@ -163,6 +166,7 @@ test-suite hermes-test
     , intern
     , mason
     , memory
+    , mono-traversable
     , parser-combinators
     , template-haskell
     , text
@@ -214,6 +218,7 @@ benchmark hermes-bench
     , intern
     , mason
     , memory
+    , mono-traversable
     , parser-combinators
     , template-haskell
     , text

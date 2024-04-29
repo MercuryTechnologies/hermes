@@ -23,6 +23,8 @@ data IfMatch
 
 instance KnownHeader IfMatch where
   type ParseFailure IfMatch = String
+  type Cardinality IfMatch = 'ZeroOrOne
+  type Direction IfMatch = 'Request
 
   parseFromHeaders _ headers = case runParser ifMatchParser (B.intercalate ", " $ NE.toList headers) of
     OK ifMatch "" -> Right ifMatch
@@ -30,7 +32,7 @@ instance KnownHeader IfMatch where
     Fail -> Left "Failed to parse If-Match header"
     Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderIfMatch
+  renderToHeaders _ = M.toStrictByteString . renderIfMatch
 
   headerName _ = hIfMatch
 

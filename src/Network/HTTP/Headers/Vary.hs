@@ -31,6 +31,8 @@ data VaryDirective = VaryAll | VaryHeader !HeaderFieldName
 
 instance KnownHeader Vary where
   type ParseFailure Vary = Maybe String
+  type Cardinality Vary = 'ZeroOrMore
+  type Direction Vary = 'Response
 
   parseFromHeaders _ headers = do
     res <- traverse runVaryParser headers

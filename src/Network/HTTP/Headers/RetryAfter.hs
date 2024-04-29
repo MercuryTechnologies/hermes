@@ -5,7 +5,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hRetryAfter)
 import Network.HTTP.Headers.Parsing.Util
@@ -16,6 +16,8 @@ data RetryAfter
 
 instance KnownHeader RetryAfter where
   type ParseFailure RetryAfter = String
+  type Cardinality RetryAfter = 'ZeroOrOne
+  type Direction RetryAfter = 'Response
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -25,7 +27,7 @@ instance KnownHeader RetryAfter where
       Fail -> Left "Failed to parse Retry-After header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderRetryAfter
+  renderToHeaders _ = M.toStrictByteString . renderRetryAfter
 
   headerName _ = hRetryAfter
 

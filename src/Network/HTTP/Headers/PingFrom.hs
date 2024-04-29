@@ -3,7 +3,7 @@ module Network.HTTP.Headers.PingFrom where
 import qualified Data.List.NonEmpty as NE
 import FlatParse.Basic
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hPingFrom)
 
 newtype PingFrom = PingFrom { pingFrom :: String }
@@ -11,6 +11,8 @@ newtype PingFrom = PingFrom { pingFrom :: String }
 
 instance KnownHeader PingFrom where
   type ParseFailure PingFrom = String
+  type Cardinality PingFrom = 'ZeroOrOne
+  type Direction PingFrom = 'Request
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -20,7 +22,7 @@ instance KnownHeader PingFrom where
       Fail -> Left "Failed to parse Ping-From header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderPingFrom
+  renderToHeaders _ = M.toStrictByteString . renderPingFrom
 
   headerName _ = hPingFrom
 

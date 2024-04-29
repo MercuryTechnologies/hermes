@@ -84,6 +84,8 @@ newtype Authorization = Authorization { authorizationCredentials :: Credentials 
 
 instance KnownHeader Authorization where
   type ParseFailure Authorization = String
+  type Cardinality Authorization = 'One
+  type Direction Authorization = 'Request
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -93,7 +95,7 @@ instance KnownHeader Authorization where
       Fail -> Left "Failed to parse Authorization header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderCredentials . authorizationCredentials
+  renderToHeaders _ = M.toStrictByteString . renderCredentials . authorizationCredentials
 
   headerName _ = hAuthorization
 

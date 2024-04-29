@@ -18,6 +18,8 @@ newtype ContentLength = ContentLength { contentLength :: Word }
 
 instance KnownHeader ContentLength where
   type ParseFailure ContentLength = String
+  type Cardinality ContentLength = 'ZeroOrOne
+  type Direction ContentLength = 'RequestAndResponse
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -27,7 +29,7 @@ instance KnownHeader ContentLength where
       Fail -> Left "Failed to parse Content-Length header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderContentLength
+  renderToHeaders _ = M.toStrictByteString . renderContentLength
 
   headerName _ = hContentLength
 

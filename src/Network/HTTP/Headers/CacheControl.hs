@@ -95,7 +95,7 @@ import qualified Data.Text.Short as TS
 import FlatParse.Basic
 import GHC.Generics
 import Prelude
-import Network.HTTP.Headers (KnownHeader(..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName
 import Network.HTTP.Headers.Parsing.Util
 
@@ -103,6 +103,9 @@ newtype CacheControl = CacheControl { cacheControlDirectives :: NonEmpty CacheCo
 
 instance KnownHeader CacheControl where
   type ParseFailure CacheControl = String
+  type Cardinality CacheControl = 'ZeroOrMore
+  type Direction CacheControl = 'RequestAndResponse
+
   parseFromHeaders _ neHeaders = (CacheControl . sconcat) <$> traverse parseCacheControlHeader neHeaders
   renderToHeaders _ = pure . BL.toStrict . BB.toLazyByteString . directivesBuilder . cacheControlDirectives
   headerName _ = hCacheControl

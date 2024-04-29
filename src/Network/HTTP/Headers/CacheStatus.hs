@@ -23,7 +23,7 @@ import Data.Text.Short (ShortText)
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hCacheStatus)
 import qualified Network.HTTP.Headers.Parsing.Util as P
 import qualified Network.HTTP.Headers.Rendering.Util as R
@@ -91,6 +91,8 @@ type FailureAccum = NE.NonEmpty (Maybe ShortText, String)
 
 instance KnownHeader CacheStatus where
   type ParseFailure CacheStatus = FailureAccum
+  type Cardinality CacheStatus = 'ZeroOrMore
+  type Direction CacheStatus = 'Response
 
   parseFromHeaders _ headers = case P.runParser cacheStatusParser (B.intercalate ", " $ NE.toList headers) of
     P.OK cacheStatus "" -> Right cacheStatus
@@ -133,7 +135,7 @@ cacheStatusEntryParser = do
           "uri-miss" -> pure UriMiss
           "vary-miss" -> pure VaryMiss
           "miss" -> pure Miss
-          "request" -> pure Request
+          "request" -> pure Network.HTTP.Headers.CacheStatus.Request
           "stale" -> pure Stale
           "partial" -> pure Partial
           _ -> pure $ UnknownForward t
@@ -201,7 +203,7 @@ renderForwardType = R.shortText . \case
   UriMiss -> "uri-miss"
   VaryMiss -> "vary-miss"
   Miss -> "miss"
-  Request -> "request"
+  Network.HTTP.Headers.CacheStatus.Request -> "request"
   Stale -> "stale"
   Partial -> "partial"
   UnknownForward t -> t

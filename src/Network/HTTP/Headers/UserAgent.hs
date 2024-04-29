@@ -27,6 +27,9 @@ data Product = Product
 
 instance KnownHeader UserAgent where
   type ParseFailure UserAgent = String
+  type Cardinality UserAgent = 'ZeroOrOne
+  type Direction UserAgent = 'Request
+
 
   parseFromHeaders _ headers = case runParser userAgentParser $ NE.head headers of
     OK userAgent "" -> Right userAgent
@@ -34,7 +37,7 @@ instance KnownHeader UserAgent where
     Fail -> Left "Failed to parse User-Agent header"
     Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderUserAgent
+  renderToHeaders _ = M.toStrictByteString . renderUserAgent
 
   headerName _ = hUserAgent
 

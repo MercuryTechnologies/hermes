@@ -9,7 +9,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hLastModified)
 import Network.HTTP.Headers.Parsing.Util
@@ -19,6 +19,8 @@ newtype LastModified = LastModified { lastModified :: UTCTime }
 
 instance KnownHeader LastModified where
   type ParseFailure LastModified = String
+  type Cardinality LastModified = 'ZeroOrOne
+  type Direction LastModified = 'Response
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -28,7 +30,7 @@ instance KnownHeader LastModified where
       Fail -> Left "Failed to parse Last-Modified header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderLastModified
+  renderToHeaders _ = M.toStrictByteString . renderLastModified
 
   headerName _ = hLastModified
 

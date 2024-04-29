@@ -1,7 +1,10 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
 module Network.HTTP.Headers
   ( KnownHeader (..)
+  , HeaderCardinality (..)
+  , HeaderIsRequestOrResponse (..)
   , HeaderMap
   , headerMapFromList
   , lookupHeader
@@ -19,13 +22,17 @@ module Network.HTTP.Headers
 import qualified Data.ByteString as BS
 import Data.CaseInsensitive (CI, foldedCase)
 import Data.HashMap.Strict (HashMap)
+import Data.MonoTraversable
+import Data.NonNull
 import qualified Data.HashMap.Strict as Map
 import Data.Kind
 import Data.List (partition)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Typeable
+import Data.Vector (Vector)
 import Network.HTTP.Headers.HeaderFieldName
+import Network.HTTP.Headers.Settings
 
 -- data Header = Header
 --   { headerName :: {-# UNPACK #-} !HeaderFieldName
@@ -62,8 +69,8 @@ deleteHeader name (HeaderMap m) = HeaderMap $ Map.delete name m
 alterRawHeader :: HeaderFieldName -> (Maybe (NonEmpty BS.ByteString) -> Maybe (NonEmpty BS.ByteString)) -> HeaderMap -> HeaderMap
 alterRawHeader name f (HeaderMap m) = HeaderMap $ Map.alter (fmap NE.reverse . f . fmap NE.reverse) name m
 
-setHeader :: forall a. KnownHeader a => a -> HeaderMap -> HeaderMap
-setHeader a (HeaderMap m) = case renderToHeaders defaultHeaderSettings a of
+setHeader :: forall a. (KnownHeader a, MonoFoldable (HeaderRenderingResult (Cardinality a)), Element (HeaderRenderingResult (Cardinality a)) ~ BS.ByteString) => a -> HeaderMap -> HeaderMap
+setHeader a (HeaderMap m) = case otoList $ renderToHeaders defaultHeaderSettings a of
   [] -> HeaderMap m
   (x : xs) -> HeaderMap $ Map.insert (headerName (Proxy :: Proxy a)) (NE.reverse (x NE.:| xs)) m
 
@@ -82,6 +89,21 @@ headerMapFromList = foldr f (HeaderMap mempty)
         g Nothing = Just $ value NE.:| []
         g (Just (x NE.:| xs)) = Just $ value NE.:| (x : xs)
 
+data HeaderCardinality = ZeroOrOne | One | ZeroOrMore | OneOrMore
+data HeaderIsRequestOrResponse = Request | Response | RequestAndResponse
+
+-- type family HeaderRenderingResult1 (f :: HeaderCardinality) :: Type -> Type where
+--   HeaderRenderingResult1 ZeroOrOne = Maybe
+--   HeaderRenderingResult1 ZeroOrMore = []
+--   HeaderRenderingResult1 One = Identity
+--   HeaderRenderingResult1 OneOrMore = NonEmpty
+
+type family HeaderRenderingResult (f :: HeaderCardinality) :: Type where
+  HeaderRenderingResult ZeroOrOne = BS.ByteString
+  HeaderRenderingResult ZeroOrMore = [BS.ByteString]
+  HeaderRenderingResult One = BS.ByteString
+  HeaderRenderingResult OneOrMore = NonNull (Vector BS.ByteString)
+
 -- addHeader :: Header -> HeaderMap -> HeaderMap
 -- addHeader (Header name value) (HeaderMap m) = HeaderMap $ Map.alter f name m
 --   where
@@ -90,25 +112,6 @@ headerMapFromList = foldr f (HeaderMap mempty)
 
 -- lookupHeader :: HeaderFieldName -> HeaderMap -> Maybe (NonEmpty ByteString)
 -- lookupHeader name (HeaderMap m) = fmap getReverse $ Map.lookup name m
-
-
--- | Settings for HTTP headers encoding and decoding.
---
--- Many browsers and web servers vary how they handle headers, so
--- this type allows you to define how you want to handle headers
--- in your application to accommodate these differences.
-data HeaderSettings = HeaderSettings
-  { maxHeaderSize :: Int
-  }
-
--- | Default settings for HTTP headers.
---
--- The default maximum header size is 8192 bytes, which is the maximum size
--- allowed by most web servers (excluding older NGINX builds, which support a max of 4kb per header). 
--- If you need to support larger headers, you can increase this value, but be aware that some servers may reject
--- headers that are too large for security reasons.
-defaultHeaderSettings :: HeaderSettings
-defaultHeaderSettings = HeaderSettings 8192
 
 -- | A typeclass for parsing and rendering well-known HTTP headers.
 --
@@ -126,6 +129,8 @@ class Typeable a => KnownHeader a where
   --
   -- When possible, it is recommended to use a more specific type than 'String'.
   type ParseFailure a :: Type
+  type Cardinality a :: HeaderCardinality
+  type Direction a :: HeaderIsRequestOrResponse
 
   -- | Parse a value from one or more headers with the same header name.
   --
@@ -140,5 +145,5 @@ class Typeable a => KnownHeader a where
   -- with the same header name.
   --
   -- If the header can be safely omitted, return '[]'. Otherwise, return a non-empty list of headers.
-  renderToHeaders :: HeaderSettings -> a -> [BS.ByteString]
+  renderToHeaders :: HeaderSettings -> a -> HeaderRenderingResult (Cardinality a)
   headerName :: proxy a -> HeaderFieldName

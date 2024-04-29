@@ -11,7 +11,7 @@ import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
 import Network.HTTP.ContentNegotiation
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hAccept)
 import Network.HTTP.Headers.Parsing.Util
 
@@ -19,6 +19,8 @@ newtype Accept = Accept { accept :: [WeightedMediaRange] }
 
 instance KnownHeader Accept where
   type ParseFailure Accept = String
+  type Cardinality Accept = 'ZeroOrOne
+  type Direction Accept = 'Request
 
   parseFromHeaders _ headers = case runParser acceptParser $ NE.head headers of
     OK accept "" -> Right accept
@@ -26,7 +28,7 @@ instance KnownHeader Accept where
     Fail -> Left "Failed to parse Accept header"
     Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderAccept
+  renderToHeaders _ = M.toStrictByteString . renderAccept
 
   headerName _ = hAccept
 

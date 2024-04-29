@@ -21,6 +21,8 @@ data Date = Date
 
 instance KnownHeader Date where
   type ParseFailure Date = String
+  type Cardinality Date = 'ZeroOrOne
+  type Direction Date = 'Response
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -30,7 +32,7 @@ instance KnownHeader Date where
       Fail -> Left "Failed to parse Date header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . C.pack . formatTime defaultTimeLocale rfc822DateFormat . date
+  renderToHeaders _ = C.pack . formatTime defaultTimeLocale rfc822DateFormat . date
 
   headerName _ = hDate
 

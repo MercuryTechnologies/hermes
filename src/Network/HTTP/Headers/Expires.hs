@@ -10,7 +10,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hExpires)
 import Network.HTTP.Headers.Parsing.Util
@@ -20,6 +20,8 @@ newtype Expires = Expires { expires :: UTCTime }
 
 instance KnownHeader Expires where
   type ParseFailure Expires = String
+  type Cardinality Expires = 'ZeroOrOne
+  type Direction Expires = 'Response
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -29,7 +31,7 @@ instance KnownHeader Expires where
       Fail -> Left "Failed to parse Expires header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderExpires
+  renderToHeaders _ = M.toStrictByteString . renderExpires
 
   headerName _ = hExpires
 

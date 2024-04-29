@@ -19,7 +19,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Text (Text)
 import qualified Data.Text.Short as ST
 import qualified Mason.Builder as M
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName
 import Network.HTTP.Headers.Parsing.Util
 
@@ -33,12 +33,14 @@ data EntityTag
 
 instance KnownHeader ETag where
   type ParseFailure ETag = String
+  type Cardinality ETag = 'ZeroOrOne
+  type Direction ETag = 'Response
 
   parseFromHeaders _ headers = case parseETag $ NE.head headers of
     Left err -> Left err
     Right etag -> Right etag
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderETag
+  renderToHeaders _ = M.toStrictByteString . renderETag
 
   headerName _ = hETag
 

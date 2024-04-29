@@ -7,7 +7,7 @@ import Data.Text.Short (ShortText)
 import Data.Time.Clock (UTCTime)
 import qualified Mason.Builder as M
 import Network.HTTP.ContentCoding
-import Network.HTTP.Headers (KnownHeader (..))
+import Network.HTTP.Headers
 import Network.HTTP.Headers.Date (dateParser, renderDate)
 import Network.HTTP.Headers.HeaderFieldName (hAcceptEncoding)
 import Network.HTTP.Headers.Parsing.Util
@@ -19,6 +19,8 @@ newtype AcceptEncoding = AcceptEncoding
 
 instance KnownHeader AcceptEncoding where
   type ParseFailure AcceptEncoding = String
+  type Cardinality AcceptEncoding = 'ZeroOrOne
+  type Direction AcceptEncoding = 'Request
 
   parseFromHeaders _ headers = do
     let header = NE.head headers
@@ -28,7 +30,7 @@ instance KnownHeader AcceptEncoding where
       Fail -> Left "Failed to parse Accept-Encoding header"
       Err err -> Left err
 
-  renderToHeaders _ = pure . M.toStrictByteString . renderAcceptEncoding
+  renderToHeaders _ = M.toStrictByteString . renderAcceptEncoding
 
   headerName _ = hAcceptEncoding
 
