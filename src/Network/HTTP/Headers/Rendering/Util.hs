@@ -11,7 +11,7 @@ import Data.Text.Short (ShortText, toShortByteString)
 import qualified Data.Text.Short as TS
 import Network.HTTP.Headers.Parsing.Util (ItemValue (..), RFC8941String (..), RFC8941Token (..))
 import Network.HTTP.Headers.Settings
-import Network.HTTP.Headers.HeaderFieldName (HeaderFieldName, fromHeaderFieldName)
+import Network.HTTP.Headers.HeaderFieldName (HeaderFieldName, toText)
 
 sepByCommas1 :: (F1.Foldable1 t, M.Buildable s) => t (M.BuilderFor s) -> (M.BuilderFor s)
 sepByCommas1 = F1.intercalate1 ", "
@@ -93,7 +93,7 @@ rfc8941Parameter ExcludeIfEmpty f k = \case
 fitHeaderSplitsToCommas :: HeaderSettings -> HeaderFieldName -> ByteString -> [ByteString]
 fitHeaderSplitsToCommas hsettings hfield bs = go bs
   where
-    chunkSize = maxHeaderSize hsettings - T.length (fromHeaderFieldName hfield) - 1
+    chunkSize = maxHeaderSize hsettings - T.length (Network.HTTP.Headers.HeaderFieldName.toText hfield) - 1
     go headerContents = if B.length headerContents <= chunkSize
       then [headerContents]
       else 

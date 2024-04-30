@@ -2,7 +2,8 @@
 {-# LANGUAGE StandaloneDeriving #-}
 module Network.HTTP.Headers.HeaderFieldName
   ( HeaderFieldName
-  , fromHeaderFieldName
+  , toText
+  , toCIByteString
   , cachedHeaderFieldName
   , headerFieldName
   , unsafeCachedHeaderFromBytestring
@@ -63,6 +64,7 @@ module Network.HTTP.Headers.HeaderFieldName
   , hContentRange
   , hContentSecurityPolicy
   , hContentSecurityPolicyReportOnly
+  , hContentDigest
   , hContentType
   , hCookie
   , hCrossOriginEmbedderPolicy
@@ -244,6 +246,8 @@ import Data.Array.Byte.Hash (SipHash(..), SipKey(..), sipHash, unstableHashKey)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Short as SBS
+import Data.CaseInsensitive (CI)
+import Data.CaseInsensitive.Unsafe (unsafeMk)
 import Data.Char (toLower)
 import Data.Hashable (Hashable(..))
 import Data.Interned
@@ -285,8 +289,11 @@ hfsCache :: Cache HeaderFieldName
 hfsCache = mkCache
 {-# NOINLINE hfsCache #-}
 
-fromHeaderFieldName :: HeaderFieldName -> Text
-fromHeaderFieldName (HeaderFieldName _ name) = name
+toText :: HeaderFieldName -> Text
+toText (HeaderFieldName _ name) = name
+
+toCIByteString :: HeaderFieldName -> CI ByteString
+toCIByteString = unsafeMk . TE.encodeUtf8 . toText
 
 -- | Construct a 'HeaderFieldName' from a text input.
 --

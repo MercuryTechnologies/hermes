@@ -7,6 +7,7 @@ module Network.HTTP.Headers
   , HeaderIsRequestOrResponse (..)
   , HeaderMap
   , headerMapFromList
+  , headerMapToList
   , lookupHeader
   , deleteHeader
   , lookupRawHeader
@@ -45,7 +46,10 @@ data HeaderMap = HeaderMap
   -- they're looked up.
   --
   -- TODO: Benchmark against using Seq instead of NonEmpty.
-  }
+  } deriving stock (Eq)
+
+instance Show HeaderMap where
+  showsPrec n x = ("headerMapFromList " ++) . showsPrec n (headerMapToList x)
 
 lookupRawHeader :: HeaderFieldName -> HeaderMap -> Maybe (NonEmpty BS.ByteString)
 lookupRawHeader name (HeaderMap m) = fmap NE.reverse $ name `Map.lookup` m
@@ -88,6 +92,13 @@ headerMapFromList = foldr f (HeaderMap mempty)
       where
         g Nothing = Just $ value NE.:| []
         g (Just (x NE.:| xs)) = Just $ value NE.:| (x : xs)
+
+headerMapToList :: HeaderMap -> [(CI BS.ByteString, BS.ByteString)]
+headerMapToList (HeaderMap m) = concatMap f $ Map.toList m
+  where
+    f (name, values) = 
+      let ciName = toCIByteString name
+      in map (\value -> (ciName, value)) $ NE.toList values
 
 data HeaderCardinality = ZeroOrOne | One | ZeroOrMore | OneOrMore
 data HeaderIsRequestOrResponse = Request | Response | RequestAndResponse
