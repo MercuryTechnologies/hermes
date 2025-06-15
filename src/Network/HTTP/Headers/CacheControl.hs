@@ -7,7 +7,7 @@ Description : Representation of HTTP Cache-Control directives
 
 Currently targeting: HTTPWG RFC 9111
 
-HTTP caching is a critical part of web performance, reducing latency and server load by reusing previously fetched resources. 
+HTTP caching is a critical part of web performance, reducing latency and server load by reusing previously fetched resources.
 The Cache-Control header plays a central role in this system, defining the caching policies directly within HTTP responses.
 
 This module provides a data type to represent the various directives that can be specified in a Cache-Control header,
@@ -15,36 +15,36 @@ allowing developers to parse, manipulate, and generate these directives programm
 
 See <https://httpwg.org/specs/rfc9111.html> for the official specification of the Cache-Control header.
 
-It is important to note that the Cache-Control MUST be respected by all caching mechanisms, including private caches and shared caches, 
+It is important to note that the Cache-Control MUST be respected by all caching mechanisms, including private caches and shared caches,
 along the request/response chain. If a directive is not understood, it MUST be treated as if it had the value "no-cache".
 
 Notes on Cache-Control Directives:
 
 __Cache-Control and Expires__
 
-In general @Cache-Control@ is considered more flexible and powerful. The Expires header specifies an absolute expiration date and time, whereas @Cache-Control@ can define caching behavior with greater granularity (e.g., max-age) and specificity (e.g., no-store, no-cache). When both headers are present, 
+In general @Cache-Control@ is considered more flexible and powerful. The Expires header specifies an absolute expiration date and time, whereas @Cache-Control@ can define caching behavior with greater granularity (e.g., max-age) and specificity (e.g., no-store, no-cache). When both headers are present,
 Cache-Control takes precedence, providing more control over how caching mechanisms should interpret the freshness of a resource.
 
 __Cache-Control and ETag/Last-Modified__
 
-ETag and Last-Modified: These headers provide validators for cached responses. 
-The ETag (Entity Tag) header gives a unique identifier for the version of the resource, 
-while Last-Modified provides a timestamp of when the resource was last changed. 
-When a browser has a cached but potentially stale response, 
-it can use these values in conditional requests (If-None-Match for ETag, If-Modified-Since for Last-Modified) 
-to check if the resource has changed. If the server responds with 304 Not Modified, 
+ETag and Last-Modified: These headers provide validators for cached responses.
+The ETag (Entity Tag) header gives a unique identifier for the version of the resource,
+while Last-Modified provides a timestamp of when the resource was last changed.
+When a browser has a cached but potentially stale response,
+it can use these values in conditional requests (If-None-Match for ETag, If-Modified-Since for Last-Modified)
+to check if the resource has changed. If the server responds with 304 Not Modified,
 the cached version can be safely reused, reducing bandwidth and load.
 
 Interplay with Cache-Control: The no-cache directive does not prevent caching but requires that the cache validates stored responses with the origin server before reuse, typically using ETag or Last-Modified values. must-revalidate further enforces that once a resource is stale, a validation must occur before its use, ensuring clients always receive up-to-date or validated content, even at the cost of additional round trips for revalidation.
 
 __@Cache-Control@ and @Vary@__
-Vary Header: The Vary header informs caches that a resource's response may vary based on the value of specified request headers. 
-For example, a response varying on the Accept-Encoding header would have different versions stored for requests that accept gzip 
+Vary Header: The Vary header informs caches that a resource's response may vary based on the value of specified request headers.
+For example, a response varying on the Accept-Encoding header would have different versions stored for requests that accept gzip
 compression versus those that do not.
 
-Interaction with Cache-Control: The presence of a Vary header can complicate caching decisions. It essentially creates a multi-dimensional 
-cache key based on the varying header fields and the request URL. Cache-Control directives still apply, but caches must also consider 
-the specific request headers listed in Vary to determine the correct version of the resource to deliver. This ensures content is accurately 
+Interaction with Cache-Control: The presence of a Vary header can complicate caching decisions. It essentially creates a multi-dimensional
+cache key based on the varying header fields and the request URL. Cache-Control directives still apply, but caches must also consider
+the specific request headers listed in Vary to determine the correct version of the resource to deliver. This ensures content is accurately
 served according to client capabilities or preferences but can increase the complexity of cache management.
 
 __General Interplay__
@@ -53,13 +53,13 @@ The combined use of these headers provides a robust framework for web caching, a
 Initial Request: A client requests a resource for the first time. The server responds with the resource, Cache-Control, ETag/Last-Modified, and optionally Vary.
 Subsequent Requests: The client stores the resource in its cache according to Cache-Control policies.
 
-Validation: Upon a cache hit for a subsequent request, if the resource is stale (max-age expired) or must-revalidate is specified, the client sends a conditional 
+Validation: Upon a cache hit for a subsequent request, if the resource is stale (max-age expired) or must-revalidate is specified, the client sends a conditional
 request with If-None-Match (using ETag) or If-Modified-Since (using Last-Modified).
 
 Server Response: The server either confirms the resource hasn't changed (with a 304 Not Modified response, allowing the cache to reuse the response) or sends a new version of the resource.
 This system, while complex, enables efficient, flexible, and scalable web content delivery, minimizing unnecessary data transfers while ensuring users receive up-to-date content.
 -}
-module Network.HTTP.Headers.CacheControl 
+module Network.HTTP.Headers.CacheControl
   ( CacheControl(..)
   , CacheControlDirective(..)
   -- * Cache control header parsing and validation
@@ -100,6 +100,7 @@ import Network.HTTP.Headers.HeaderFieldName
 import Network.HTTP.Headers.Parsing.Util
 
 newtype CacheControl = CacheControl { cacheControlDirectives :: NonEmpty CacheControlDirective }
+  deriving stock (Eq, Show)
 
 instance KnownHeader CacheControl where
   type ParseFailure CacheControl = String
@@ -117,7 +118,7 @@ instance KnownHeader CacheControl where
 --
 -- Note that this type is not exhaustive and may not include all possible directives.
 --
--- 
+--
 data CacheControlDirective
   -- | Indicates the response can be cached by any cache.
   = Public
@@ -151,7 +152,7 @@ data CacheControlDirective
 
 instance Hashable CacheControlDirective
 
-data UsableDirectives = UsableDirectives 
+data UsableDirectives = UsableDirectives
   { usableDirectives :: [CacheControlDirective]
   , unusableDirectives :: [CacheControlDirective]
   , unknownDirectives :: [(ShortText, Maybe ShortText)]
@@ -202,14 +203,14 @@ updatePresence directive presence = case directive of
 -- Function to check for well-known directive conflicts based on the tracked presence.
 checkConflicts :: DirectivePresence -> Validation (NonEmpty String) DirectivePresence
 checkConflicts p@DirectivePresence{..} = pure p <* foldMap1 validationNel
-  ( 
-    (when 
-      (hasPrivate && hasPublic) 
+  (
+    (when
+      (hasPrivate && hasPublic)
       (Left "private conflicts with public."))
     :|
     [ when
-        ( hasNoStore && 
-          or 
+        ( hasNoStore &&
+          or
             [ hasPrivate
             , hasPublic
             , hasMaxAge
@@ -219,18 +220,18 @@ checkConflicts p@DirectivePresence{..} = pure p <* foldMap1 validationNel
             , hasStaleWhileRevalidate
             , hasStaleIfError
             ]
-        )   
+        )
         (Left "no-store conflicts with directives that imply storage.")
-    , when 
-        (hasPrivate && hasSMaxAge) 
+    , when
+        (hasPrivate && hasSMaxAge)
         (Left "private conflicts with s-maxage since proxies should not be storing content.")
-    , when 
-        (hasImmutable && (hasStaleWhileRevalidate || hasStaleIfError)) 
+    , when
+        (hasImmutable && (hasStaleWhileRevalidate || hasStaleIfError))
         (Left "immutable conflicts with directives that imply stale content.")
     ]
   )
 
--- | Validate the list of CacheControlDirectives. This function returns a Left value with an error message if 
+-- | Validate the list of CacheControlDirectives. This function returns a Left value with an error message if
 -- there are conflicts between directives. The presence of unknown directives is ignored, although you MUST
 -- handle them in a manner appropriate to your application logic.
 validateCacheDirectives :: [CacheControlDirective] -> Validation (NonEmpty String) DirectivePresence
@@ -296,7 +297,7 @@ directiveParser = $(switch [| case _ of
   "no-transform" -> pure NoTransform
   "immutable" -> pure Immutable
   "stale-while-revalidate" -> numericDirective StaleWhileRevalidate
-  "stale-if-error" -> numericDirective StaleIfError 
+  "stale-if-error" -> numericDirective StaleIfError
   _ -> do
     k <- rfc9110Token
     option (Unknown k Nothing) (Unknown k . Just <$> ($(char '=') *> (rfc9110Token <|> quotedString))) |])

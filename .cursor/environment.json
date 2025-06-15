@@ -1,0 +1,11 @@
+{
+  "snapshot": "snapshot-20250615-bbdbd847-6121-4650-a2fc-a394d0dff1ab",
+  "install": ". /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh\n",
+  "start": ". /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh\n",
+  "terminals": [
+    {
+      "name": "devenv shell",
+      "command": "devenv shell"
+    }
+  ]
+}

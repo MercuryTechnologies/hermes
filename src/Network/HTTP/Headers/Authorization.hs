@@ -1,5 +1,13 @@
 {-# LANGUAGE TemplateHaskell #-}
-module Network.HTTP.Headers.Authorization where
+module Network.HTTP.Headers.Authorization
+  ( Authorization (..)
+  , Credentials (..)
+  , CredentialContents (..)
+  , AuthScheme (..)
+  , CredentialParam (..)
+  , credentialsParser
+  , renderCredentials
+  ) where
 import Control.Monad.Combinators.NonEmpty
 import Data.ByteString (ByteString)
 import Data.Text.Short (ShortText)
@@ -9,7 +17,7 @@ import qualified Data.List.NonEmpty as NE
 import Data.Maybe (fromMaybe)
 import Data.String
 import FlatParse.Basic
-import Network.HTTP.Headers.Parsing.Util 
+import Network.HTTP.Headers.Parsing.Util
 import qualified Network.HTTP.Headers.Rendering.Util as R
 import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName

@@ -1,0 +1,269 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+# HTTP Network Package Guide
+
+## Project Overview
+
+This is a comprehensive HTTP network package written in Haskell that provides type-safe implementations of HTTP concepts including methods, status codes, headers, and more. The package is designed with a focus on performance and well-tested parsing and serialization according to the relevant IETF, W3C, or other specifications.
+
+Implement a high-performance HTTP client and server.
+
+The library is organized into several key components:
+
+### 1. HTTP Methods (`Methods.hs`)
+- Type-safe representation of HTTP methods (GET, POST, PUT, etc.)
+- Support for standard and WebDAV methods
+- Efficient interning for method names
+- Case-insensitive comparison and hashing
+
+### 2. HTTP Status Codes (`Status.hs`)
+- Complete set of IANA-registered HTTP status codes
+- Type-safe status code representation
+- Efficient numeric encoding
+- Comprehensive documentation with RFC references
+
+### 3. HTTP Versions (`Versions.hs`)
+- Support for HTTP/0.9 through HTTP/3.0
+- Efficient version encoding
+- Type-safe version comparison
+- Version-specific constants
+
+### 4. Header Field Names (`HeaderFieldName.hs`)
+- Central registry of all IANA-registered HTTP header field names, as well as common non-standard headers.
+- Provides type-safe constants for all standard headers
+- Implements case-insensitive comparison and hashing
+- Uses interning for efficient memory usage and comparisons
+- Headers are categorized as:
+  - Permanent
+  - Provisional
+  - Deprecated
+  - Obsoleted
+
+## Future Plans
+
+### HTTP Client Implementation
+- High-performance HTTP client with support for HTTP/1.1, HTTP/2, and HTTP/3
+- Connection pooling and keep-alive support
+- Automatic retry and backoff strategies
+- Streaming response handling
+- TLS/SSL support
+- Cookie management
+- Proxy support
+- Comprehensive timeout handling
+
+### HTTP Server Implementation
+- High-performance HTTP server with support for HTTP/1.1, HTTP/2, and HTTP/3
+- Efficient request routing
+- Middleware support
+- WebSocket support
+- Static file serving
+- Compression support
+- Security features (CORS, CSP, etc.)
+- Graceful shutdown handling
+
+## Performance Considerations
+
+### Current Optimizations
+1. **Memory Efficiency**
+   - Use of `ShortText` for small strings
+   - Efficient interning for header names and methods
+   - Compact representation of status codes and versions
+   - Zero-copy parsing where possible
+
+2. **String Handling**
+   - Use of `ByteString` for binary data
+   - Efficient string comparison with case-insensitive hashing
+   - Builder pattern for string construction
+   - Minimal string allocations
+
+3. **Type Safety**
+   - Strong type system to prevent runtime errors
+   - Exhaustive pattern matching
+   - Newtype wrappers for semantic meaning
+   - Type-level guarantees for parsing and rendering
+
+### Planned Optimizations
+1. **Network Performance**
+   - Zero-copy network I/O
+   - Efficient buffer management
+   - Connection pooling
+   - Request/response pipelining
+   - HTTP/2 multiplexing
+
+2. **Concurrency**
+   - Lightweight thread management
+   - Efficient event loop implementation
+   - Lock-free data structures
+   - Work stealing scheduler
+
+3. **Memory Management**
+   - Custom allocator for network buffers
+   - Object pooling for frequently allocated structures
+   - Efficient garbage collection strategies
+   - Memory-mapped file support
+
+## Best Practices
+
+1. **Type Safety**
+   - Use the most specific type possible
+   - Avoid unsafe conversions
+   - Leverage the type system for validation
+   - Use newtype wrappers for semantic meaning
+
+2. **Performance**
+   - Use appropriate data structures
+   - Minimize allocations
+   - Leverage zero-copy operations
+   - Profile and optimize hot paths
+   - Write and maintain benchmarks for all performance-critical code
+   - Document performance characteristics and trade-offs
+
+3. **RFC Compliance**
+   - Strict adherence to RFC specifications
+   - Comprehensive test coverage
+   - Clear documentation of RFC references
+   - Proper error handling
+
+## Benchmarking Standards
+
+Use criterion, the Haskell library, for benchmarking.
+
+Benchmark suites are defined in [hermes.cabal](mdc:hermes.cabal), and there should be separate benchmark suites for
+each "domain" being addressed: serde, http client support, and http server support.
+
+### Core Principles
+1. **Continuous Benchmarking**
+   - Every performance-critical component must have benchmarks
+   - Benchmarks must be run as part of CI/CD pipeline
+   - Performance regressions must be caught before merging
+   - Historical performance data must be tracked and visualized
+
+2. **Benchmark Categories**
+   - Micro-benchmarks for individual functions
+   - Component-level benchmarks for subsystems
+   - End-to-end benchmarks for complete workflows
+   - Memory usage and allocation benchmarks
+   - Network I/O benchmarks
+   - Concurrency and scalability benchmarks
+
+3. **Benchmark Requirements**
+   - Must use `criterion` for statistical analysis
+   - Must include memory profiling with `weigh`
+   - Must measure both mean and variance
+   - Must include worst-case scenarios
+   - Must be reproducible across environments
+   - Must include baseline comparisons
+
+4. **Benchmark Documentation**
+   - Clear description of what is being measured
+   - Hardware and environment specifications
+   - Expected performance characteristics
+   - Known limitations and edge cases
+   - Comparison with industry standards
+   - Performance optimization history
+
+### Performance Targets
+
+1. **Header Processing**
+   - Parse 1M headers/second on modern hardware
+   - < 100ns per header for common cases
+   - Zero allocations for hot paths
+   - < 4KB memory overhead per connection baseline
+
+2. **Network I/O**
+   - < 1ms latency for local requests
+   - > 100K requests/second for HTTP/1.1
+   - > 500K requests/second for HTTP/2
+   - > 1M requests/second for HTTP/3
+   - < 1% CPU overhead per 10K connections
+
+3. **Memory Usage**
+   - HTTP/1.1: 4-8KB per connection baseline
+   - HTTP/2: 8-16KB per connection baseline
+   - HTTP/3: 16-32KB per connection baseline
+   - Additional 2-4KB per active stream
+   - < 1GB for 100K concurrent connections
+   - Zero-copy for request/response bodies where possible
+   - Memory usage should scale sub-linearly with connection count
+   - Allow for configurable buffer sizes based on use case
+
+4. **Memory Management Strategy**
+   - Use memory pools for frequently allocated objects
+   - Implement buffer recycling for request/response bodies
+   - Maintain separate pools for different connection types
+   - Allow dynamic buffer size adjustment based on load
+   - Monitor and limit maximum memory usage per connection
+   - Implement backpressure mechanisms to prevent OOM
+   - Use memory-mapped files for large static content
+   - Consider NUMA-aware allocation for multi-socket systems
+
+### Benchmark Maintenance
+
+1. **Regular Review**
+   - Weekly performance regression checks
+   - Monthly benchmark suite updates
+   - Quarterly performance target reviews
+   - Annual hardware baseline updates
+
+2. **Performance Monitoring**
+   - Real-time performance metrics
+   - Automated regression detection
+   - Performance trend analysis
+   - Resource usage tracking
+
+3. **Optimization Process**
+   - Identify bottlenecks through profiling
+   - Implement and measure optimizations
+   - Document performance improvements
+   - Update benchmarks for new features
+
+## References
+
+- RFC HTTP Semantics
+- RFC HTTP Caching
+- RFC HTTP 1.1
+- RFC HTTP 2
+- RFC HTTP 3
+- IANA headers registry
+
+## I/O Optimization Strategy
+
+### Core I/O Principles
+1. **Zero-Copy Operations**
+   - Use `sendfile` for static file serving where available
+   - Implement scatter-gather I/O for headers and body
+   - Avoid unnecessary data copying
+   - Use memory-mapped files where appropriate
+
+2. **Asynchronous I/O**
+   - Leverage GHC's event manager
+   - Batch I/O operations where possible
+   - Efficient event loop implementation
+   - Use appropriate concurrency primitives
+
+### I/O Benchmarking
+1. **Metrics to Track**
+   - I/O operation latency
+   - System call overhead
+   - Buffer allocation time
+   - Memory bandwidth usage
+   - CPU cache efficiency
+   - Context switch frequency
+
+2. **Benchmark Categories**
+   - Raw I/O throughput
+   - Connection handling
+   - File transfer performance
+   - Memory allocation patterns
+   - System call frequency
+   - Context switch overhead
+
+3. **Performance Targets**
+   - < 100ns per I/O operation
+   - < 1% CPU overhead for I/O
+   - > 10Gbps throughput per core
+   - < 1% packet loss under load
+   - Zero allocation for hot paths

@@ -77,6 +77,7 @@ module Network.HTTP.Headers.HeaderFieldName
   , hDAV
   , hDeltaBase
   , hDepth
+  , hDerivedFrom
   , hDestination
   , hDPoP
   , hDPoPNonce
@@ -154,6 +155,7 @@ module Network.HTTP.Headers.HeaderFieldName
   , hSecWebSocketKey
   , hSecWebSocketProtocol
   , hSecWebSocketVersion
+  , hSecurityScheme
   , hServer
   , hServerTiming
   , hSetCookie
@@ -241,8 +243,9 @@ module Network.HTTP.Headers.HeaderFieldName
   , hWarning
   ) where
 
+import Control.DeepSeq (NFData(..))
 import Control.Exception
-import Data.Array.Byte.Hash (SipHash(..), SipKey(..), sipHash, unstableHashKey)
+import Data.Binary
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Short as SBS
@@ -250,47 +253,39 @@ import Data.CaseInsensitive (CI)
 import Data.CaseInsensitive.Unsafe (unsafeMk)
 import Data.Char (toLower)
 import Data.Hashable (Hashable(..))
-import Data.Interned
-import Data.Interned.Internal (recover)
-import Data.Interned.Text
 import Data.String (IsString(..))
 import Data.Text.Internal (Text(..))
 import qualified Data.Text as T
 import qualified Data.Text.Array as A
 import qualified Data.Text.Encoding as TE
+import Symbolize
 import System.IO.Unsafe (unsafeDupablePerformIO)
+import Text.Read
 
 -- | The type of a header field name.
-data HeaderFieldName where
-  HeaderFieldName :: {-# UNPACK #-} !SipHash -> {-# UNPACK #-} !Text -> HeaderFieldName
+newtype HeaderFieldName = HeaderFieldName { fromHeaderFieldName :: Symbol }
+  deriving newtype (Binary, NFData, Eq, Ord, Hashable)
+
+instance Read HeaderFieldName where
+  readPrec = do
+    str <- readPrec @String
+    return $ HeaderFieldName $ intern $ fmap toLower str
+
+instance Show HeaderFieldName where
+  showsPrec _ (HeaderFieldName symbol) =
+    let !str = unintern @String symbol
+    in shows str
+
+instance IsString HeaderFieldName where
+  fromString = HeaderFieldName . fromString . fmap toLower
 
 data InvalidHeaderFieldName = InvalidHeaderFieldName Text
   deriving (Show)
 
 instance Exception InvalidHeaderFieldName
 
-instance Interned HeaderFieldName where
-  data Description HeaderFieldName = HeaderFieldNameDescription !SipHash
-  type Uninterned HeaderFieldName = Text
-  describe = HeaderFieldNameDescription . sipHash 1 3 unstableHashKey
-  identify fid_ txt = HeaderFieldName (SipHash $ fromIntegral fid_) txt
-  cache = hfsCache
-
-deriving instance Eq (Description HeaderFieldName)
-deriving instance Ord (Description HeaderFieldName)
-instance Hashable (Description HeaderFieldName) where
-  hash (HeaderFieldNameDescription (SipHash h)) = (fromIntegral h) :: Int
-  hashWithSalt salt (HeaderFieldNameDescription (SipHash h)) = hashWithSalt salt ((fromIntegral h) :: Int)
-
-instance IsString HeaderFieldName where
-  fromString = cachedHeaderFieldName . fromString
-
-hfsCache :: Cache HeaderFieldName
-hfsCache = mkCache
-{-# NOINLINE hfsCache #-}
-
 toText :: HeaderFieldName -> Text
-toText (HeaderFieldName _ name) = name
+toText (HeaderFieldName name) = unintern name
 
 toCIByteString :: HeaderFieldName -> CI ByteString
 toCIByteString = unsafeMk . TE.encodeUtf8 . toText
@@ -302,7 +297,7 @@ toCIByteString = unsafeMk . TE.encodeUtf8 . toText
 -- and other frequently used headers.
 cachedHeaderFieldName :: Text -> HeaderFieldName
 cachedHeaderFieldName txt
-  | T.isAscii txt = intern $ T.toLower txt
+  | T.isAscii txt = HeaderFieldName $ intern $ T.toLower txt
   | otherwise = throw $ InvalidHeaderFieldName txt
 {-# INLINE cachedHeaderFieldName #-}
 
@@ -314,14 +309,8 @@ cachedHeaderFieldName txt
 -- This function is therefore suitable for arbitrary user input while reducing the
 -- number of allocations and comparisons for well-known header field names.
 headerFieldName :: Text -> HeaderFieldName
-headerFieldName txt 
-  | T.isAscii txt = unsafeDupablePerformIO $ do
-      let caseFolded = T.toLower txt
-          hashed = sipHash 1 3 unstableHashKey caseFolded
-      mKnown <- recover $ HeaderFieldNameDescription hashed
-      case mKnown of
-        Just known -> pure known
-        Nothing -> pure $! HeaderFieldName hashed caseFolded
+headerFieldName txt
+  | T.isAscii txt = HeaderFieldName $ intern txt
   | otherwise = throw $ InvalidHeaderFieldName txt
 {-# INLINE headerFieldName #-}
 
@@ -330,12 +319,10 @@ headerFieldName txt
 -- This function will interns the text, so it is not suitable for arbitrary user input.
 --
 -- __Warning__: This function is unsafe because it does not check if the input is valid ASCII,
--- a valid header field name according to the HTTP spec, and it does not fold the input to 
+-- a valid header field name according to the HTTP spec, and it does not fold the input to
 -- lowercase.
 unsafeCachedHeaderFromBytestring :: ByteString -> HeaderFieldName
-unsafeCachedHeaderFromBytestring bs =
-  let !(SBS.SBS arr) = SBS.toShort bs
-  in intern $ Text (A.ByteArray arr) 0 (BS.length bs)
+unsafeCachedHeaderFromBytestring = HeaderFieldName . intern
 {-# INLINE unsafeCachedHeaderFromBytestring #-}
 
 -- | Construct a 'HeaderFieldName' from a bytestring input that is a well-formed, case-folded header.
@@ -343,37 +330,18 @@ unsafeCachedHeaderFromBytestring bs =
 -- This function will not intern the text, so it is suitable for arbitrary user input.
 --
 -- __Warning__: This function is unsafe because it does not check if the input is valid ASCII,
--- a valid header field name according to the HTTP spec, and it does not fold the input to 
+-- a valid header field name according to the HTTP spec, and it does not fold the input to
 -- lowercase.
 unsafeUnknownHeaderFromBytestring :: ByteString -> HeaderFieldName
-unsafeUnknownHeaderFromBytestring bs = unsafeDupablePerformIO $ do
-  let !sbs@(SBS.SBS arr) = SBS.toShort bs
-      hashed = sipHash 1 3 unstableHashKey sbs
-  mKnown <- recover $ HeaderFieldNameDescription hashed
-  case mKnown of
-    Just known -> pure known
-    Nothing -> pure $! HeaderFieldName hashed $ Text (A.ByteArray arr) 0 (BS.length bs)
+unsafeUnknownHeaderFromBytestring = HeaderFieldName . intern
 {-# INLINE unsafeUnknownHeaderFromBytestring #-}
 
 -- | Convert a 'HeaderFieldName' to a 'ShortByteString'.
 headerNameToShortByteString :: HeaderFieldName -> SBS.ShortByteString
-headerNameToShortByteString (HeaderFieldName _ (Text (A.ByteArray name) _ _)) = SBS.SBS name 
+headerNameToShortByteString (HeaderFieldName sym) = unintern sym
 
 headerNameFromShortByteString :: SBS.ShortByteString -> HeaderFieldName
 headerNameFromShortByteString !sbs@(SBS.SBS arr) = headerFieldName $ Text (A.ByteArray arr) 0 (SBS.length sbs)
-
-instance Eq HeaderFieldName where
-  HeaderFieldName _ a == HeaderFieldName _ b = a == b
-
-instance Ord HeaderFieldName where
-  HeaderFieldName _ a `compare` HeaderFieldName _ b = a `compare` b
-
-instance Hashable HeaderFieldName where
-  hash (HeaderFieldName (SipHash h) _) = fromIntegral h
-  hashWithSalt salt (HeaderFieldName (SipHash h) _) = hashWithSalt salt (fromIntegral h :: Int)
-
-instance Show HeaderFieldName where
-  show (HeaderFieldName _ name) = show name
 
 -- | 'A-IM' HTTP Header
 -- Permanent: [RFC 3229: Delta encoding in HTTP](https://datatracker.ietf.org/doc/html/rfc3229)

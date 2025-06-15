@@ -1,7 +1,8 @@
-module Network.HTTP.Headers.IfModifiedSince 
-  ( renderIfModifiedSince
+module Network.HTTP.Headers.IfModifiedSince
+  ( IfModifiedSince(..)
+  , renderIfModifiedSince
   , ifModifiedSinceParser
-  ) where 
+  ) where
 
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C

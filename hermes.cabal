@@ -1,6 +1,6 @@
 cabal-version: 2.2
 
--- This file has been generated from package.yaml by hpack version 0.35.5.
+-- This file has been generated from package.yaml by hpack version 0.37.0.
 --
 -- see: https://github.com/sol/hpack
 
@@ -25,39 +25,54 @@ source-repository head
 
 library
   exposed-modules:
-      Data.Array.Byte.Hash
+      Data.ByteString.Defragmented
+      Foreign.Marshall.Mimalloc
       Network.HTTP.ContentCoding
       Network.HTTP.ContentNegotiation
       Network.HTTP.Headers
       Network.HTTP.Headers.Accept
       Network.HTTP.Headers.AcceptEncoding
+      Network.HTTP.Headers.AcceptLanguage
       Network.HTTP.Headers.Age
+      Network.HTTP.Headers.Allow
       Network.HTTP.Headers.Authorization
       Network.HTTP.Headers.CacheControl
       Network.HTTP.Headers.CacheStatus
+      Network.HTTP.Headers.Connection
+      Network.HTTP.Headers.ContentDisposition
       Network.HTTP.Headers.ContentEncoding
       Network.HTTP.Headers.ContentLength
+      Network.HTTP.Headers.ContentType
+      Network.HTTP.Headers.Cookie
       Network.HTTP.Headers.Date
       Network.HTTP.Headers.ETag
       Network.HTTP.Headers.Expires
       Network.HTTP.Headers.From
       Network.HTTP.Headers.HeaderFieldName
+      Network.HTTP.Headers.Host
       Network.HTTP.Headers.IfMatch
       Network.HTTP.Headers.IfModifiedSince
       Network.HTTP.Headers.IfNoneMatch
       Network.HTTP.Headers.IfUnmodifiedSince
+      Network.HTTP.Headers.KeepAlive
       Network.HTTP.Headers.LastModified
+      Network.HTTP.Headers.Location
+      Network.HTTP.Headers.Origin
       Network.HTTP.Headers.Parsing.Util
       Network.HTTP.Headers.PingFrom
       Network.HTTP.Headers.PingTo
       Network.HTTP.Headers.ProxyAuthorization
+      Network.HTTP.Headers.Referer
       Network.HTTP.Headers.Rendering.Util
       Network.HTTP.Headers.RetryAfter
       Network.HTTP.Headers.Server
+      Network.HTTP.Headers.SetCookie
       Network.HTTP.Headers.Settings
       Network.HTTP.Headers.Sunset
+      Network.HTTP.Headers.TransferEncoding
       Network.HTTP.Headers.UserAgent
       Network.HTTP.Headers.Vary
+      Network.HTTP.Headers.WWWAuthenticate
       Network.HTTP.Methods
       Network.HTTP.Path
       Network.HTTP.QueryParameters
@@ -66,6 +81,8 @@ library
       Network.IPAddress
       Network.Mailbox
       Network.TLS.Extensions
+      Network.Wai.RequestParser
+      Network.Wai.SimpleServer
   other-modules:
       Paths_hermes
   autogen-modules:
@@ -87,22 +104,30 @@ library
       TypeApplications
       TypeFamilies
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  include-dirs:
+      cbits/mimalloc/include
+  c-sources:
+      cbits/mimalloc/src/static.c
   build-depends:
       MonadRandom
     , base >=4.7 && <5
+    , binary
+    , bitvec
     , bytestring
     , case-insensitive
     , charset
     , containers
+    , deepseq
     , flatparse
     , foldl
     , hashable
     , http-types
-    , intern
     , mason
     , memory
     , mono-traversable
+    , network >=3.1.2.1
     , parser-combinators
+    , symbolize
     , template-haskell
     , text
     , text-short
@@ -111,6 +136,62 @@ library
     , unordered-containers
     , validation
     , vector
+    , wai >=3.2.3
+  default-language: Haskell2010
+
+executable simple-server-example
+  main-is: SimpleServerExample.hs
+  other-modules:
+      Paths_hermes
+  autogen-modules:
+      Paths_hermes
+  hs-source-dirs:
+      examples
+  default-extensions:
+      DataKinds
+      DeriveGeneric
+      DerivingStrategies
+      FlexibleInstances
+      GADTs
+      GeneralizedNewtypeDeriving
+      LambdaCase
+      NumericUnderscores
+      OverloadedStrings
+      RankNTypes
+      ScopedTypeVariables
+      TypeApplications
+      TypeFamilies
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      MonadRandom
+    , base >=4.7 && <5
+    , binary
+    , bitvec
+    , bytestring
+    , case-insensitive
+    , charset
+    , containers
+    , deepseq
+    , flatparse
+    , foldl
+    , hashable
+    , hermes
+    , http-types
+    , mason
+    , memory
+    , mono-traversable
+    , network >=3.1.2.1
+    , parser-combinators
+    , symbolize
+    , template-haskell
+    , text
+    , text-short
+    , time
+    , transformers
+    , unordered-containers
+    , validation
+    , vector
+    , wai
   default-language: Haskell2010
 
 test-suite hermes-test
@@ -149,10 +230,13 @@ test-suite hermes-test
   build-depends:
       MonadRandom
     , base >=4.7 && <5
+    , binary
+    , bitvec
     , bytestring
     , case-insensitive
     , charset
     , containers
+    , deepseq
     , flatparse
     , foldl
     , hashable
@@ -162,11 +246,12 @@ test-suite hermes-test
     , hspec-discover
     , hspec-hedgehog
     , http-types
-    , intern
     , mason
     , memory
     , mono-traversable
+    , network >=3.1.2.1
     , parser-combinators
+    , symbolize
     , template-haskell
     , text
     , text-short
@@ -175,6 +260,7 @@ test-suite hermes-test
     , unordered-containers
     , validation
     , vector
+    , wai >=3.2.3
   default-language: Haskell2010
 
 benchmark hermes-bench
@@ -204,21 +290,25 @@ benchmark hermes-bench
   build-depends:
       MonadRandom
     , base >=4.7 && <5
+    , binary
+    , bitvec
     , bytestring
     , case-insensitive
     , charset
     , containers
     , criterion
+    , deepseq
     , flatparse
     , foldl
     , hashable
     , hermes
     , http-types
-    , intern
     , mason
     , memory
     , mono-traversable
+    , network >=3.1.2.1
     , parser-combinators
+    , symbolize
     , template-haskell
     , text
     , text-short
@@ -227,4 +317,5 @@ benchmark hermes-bench
     , unordered-containers
     , validation
     , vector
+    , wai >=3.2.3
   default-language: Haskell2010

@@ -1,7 +1,7 @@
 {-# LANGUAGE DeriveLift #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE TemplateHaskell #-}
-module Network.HTTP.Headers.Parsing.Util 
+module Network.HTTP.Headers.Parsing.Util
   ( module Network.HTTP.Headers.Parsing.Util
   , module FlatParse.Basic
   ) where
@@ -61,11 +61,11 @@ tokenCharSet :: CharSet
 tokenCharSet = alnum <> "-+.^_`|~!#$%&'*"
 
 rfc9110Token :: ParserT st e ST.ShortText
-rfc9110Token = shortASCIIFromParser_ $ some (satisfyAscii (`CharSet.member` tokenCharSet)) 
+rfc9110Token = shortASCIIFromParser_ $ some (satisfyAscii (`CharSet.member` tokenCharSet))
 {-# INLINE rfc9110Token #-}
 
 rfc9110TokenBS :: ParserT st e ByteString
-rfc9110TokenBS = byteStringOf $ some (satisfyAscii (`CharSet.member` tokenCharSet)) 
+rfc9110TokenBS = byteStringOf $ some (satisfyAscii (`CharSet.member` tokenCharSet))
 {-# INLINE rfc9110TokenBS #-}
 
 fieldName :: ParserT st e ST.ShortText
@@ -79,10 +79,10 @@ quotedPairCharSet :: CharSet
 quotedPairCharSet = "\t !-~" <> obsTextCharSet
 
 quotedCharSet :: CharSet
-quotedCharSet = 
-  "\t \x21" <> 
-  CharSet.fromList ['\x2A'..'\x5B'] <> 
-  CharSet.fromList ['\x5D'..'\x7E'] <> 
+quotedCharSet =
+  "\t \x21" <>
+  CharSet.fromList ['\x2A'..'\x5B'] <>
+  CharSet.fromList ['\x5D'..'\x7E'] <>
   obsTextCharSet
 
 -- quotedChar :: (Char -> Either String Bool) -> Either String Bool -> Char -> Maybe (Either String Bool)
@@ -95,9 +95,9 @@ quotedCharSet =
 -- quotedChar _ (Left c) _ = Nothing
 
 quotedString :: ParserT st e ST.ShortText
-quotedString = between 
-  $(char '"') 
-  $(char '"') 
+quotedString = between
+  $(char '"')
+  $(char '"')
   (ST.pack <$> many (unescapedChar <|> escapedChar))
   where
     unescapedChar = satisfyAscii (`CharSet.member` quotedCharSet)
@@ -107,20 +107,20 @@ quotedString = between
 {-# INLINE quotedString #-}
 
 commentCharSet :: CharSet
-commentCharSet = 
-  "\t " <> 
-  CharSet.fromList ['\x21'..'\x27'] <> 
-  CharSet.fromList ['\x2A'..'\x5B'] <> 
-  CharSet.fromList ['\x5D'..'\x7E'] <> 
+commentCharSet =
+  "\t " <>
+  CharSet.fromList ['\x21'..'\x27'] <>
+  CharSet.fromList ['\x2A'..'\x5B'] <>
+  CharSet.fromList ['\x5D'..'\x7E'] <>
   obsTextCharSet
 
 newtype Comment = Comment { fromComment :: Text }
   deriving stock (Eq, Show)
 
 comment :: ParserT st e Text
-comment = between 
-  $(char '(') 
-  $(char ')') 
+comment = between
+  $(char '(')
+  $(char ')')
   (Text.pack <$> many (unescapedChar <|> escapedChar))
   where
     unescapedChar = satisfyAscii (`CharSet.member` quotedCharSet)
@@ -188,10 +188,10 @@ rfc8941Decimal :: ParserT st String Milli
 rfc8941Decimal = do
   sign <- branch $(char '-') (pure negate) (pure id)
   decimalPart <- anyAsciiDecimalInteger
-  fracPart <- branch $(char '.') 
+  fracPart <- branch $(char '.')
     ( do
       startingZeros <- length <$> many (satisfyAscii (== '0'))
-      withOption 
+      withOption
         anyAsciiDecimalInteger
         (\fractionalPart -> pure (fractionalPart * 10 ^ negate startingZeros))
         (pure 0)
@@ -334,3 +334,8 @@ embedError (ParserT f) hdl = ParserT $ \fp eob s st -> case f fp eob s st of
   OK# st' x a -> OK# st' x a
   Fail# st' -> Fail# st'
 {-# inline embedError #-}
+
+-- | Take the rest of the input as a ShortText
+takeRestShortText :: ParserT st e ST.ShortText
+takeRestShortText = withByteString takeRest $ \_ bs -> pure $ STU.fromByteStringUnsafe bs
+{-# INLINE takeRestShortText #-}

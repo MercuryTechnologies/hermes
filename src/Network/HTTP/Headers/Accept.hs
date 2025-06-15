@@ -1,4 +1,4 @@
-module Network.HTTP.Headers.Accept 
+module Network.HTTP.Headers.Accept
   ( Accept (..)
   , acceptParser
   , renderAccept
@@ -16,6 +16,7 @@ import Network.HTTP.Headers.HeaderFieldName (hAccept)
 import Network.HTTP.Headers.Parsing.Util
 
 newtype Accept = Accept { accept :: [WeightedMediaRange] }
+  deriving stock (Eq, Show)
 
 instance KnownHeader Accept where
   type ParseFailure Accept = String

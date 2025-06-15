@@ -1,3 +1,4 @@
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE UndecidableSuperClasses #-}
@@ -18,6 +19,8 @@ module Network.HTTP.Headers
   , HeaderSettings
   , defaultHeaderSettings
   , maxHeaderSize
+  , HeaderRenderingResult
+  , HeaderRenderingResultToNonEmpty(..)
   ) where
 
 import qualified Data.ByteString as BS
@@ -32,6 +35,7 @@ import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Typeable
 import Data.Vector (Vector)
+import qualified Data.Vector as V
 import Network.HTTP.Headers.HeaderFieldName
 import Network.HTTP.Headers.Settings
 
@@ -40,7 +44,7 @@ import Network.HTTP.Headers.Settings
 --   , headerValue :: {-# UNPACK #-} !ByteString
 --   }
 
-data HeaderMap = HeaderMap 
+data HeaderMap = HeaderMap
   { headerMapToMap :: {-# UNPACK #-} !(HashMap HeaderFieldName (NonEmpty BS.ByteString))
   -- ^ Internal invariant: fields are stored in reverse order. They're reversed when
   -- they're looked up.
@@ -96,7 +100,7 @@ headerMapFromList = foldr f (HeaderMap mempty)
 headerMapToList :: HeaderMap -> [(CI BS.ByteString, BS.ByteString)]
 headerMapToList (HeaderMap m) = concatMap f $ Map.toList m
   where
-    f (name, values) = 
+    f (name, values) =
       let ciName = toCIByteString name
       in map (\value -> (ciName, value)) $ NE.toList values
 
@@ -115,6 +119,18 @@ type family HeaderRenderingResult (f :: HeaderCardinality) :: Type where
   HeaderRenderingResult One = BS.ByteString
   HeaderRenderingResult OneOrMore = NonNull (Vector BS.ByteString)
 
+class HeaderRenderingResultToNonEmpty (f :: HeaderCardinality) where
+  headerRenderingResultToNonEmpty :: HeaderRenderingResult f -> NonEmpty BS.ByteString
+
+instance HeaderRenderingResultToNonEmpty ZeroOrOne where
+  headerRenderingResultToNonEmpty = NE.singleton
+instance HeaderRenderingResultToNonEmpty ZeroOrMore where
+  headerRenderingResultToNonEmpty = NE.fromList
+instance HeaderRenderingResultToNonEmpty One where
+  headerRenderingResultToNonEmpty = NE.singleton
+instance HeaderRenderingResultToNonEmpty OneOrMore where
+  headerRenderingResultToNonEmpty = toNonEmpty
+
 -- addHeader :: Header -> HeaderMap -> HeaderMap
 -- addHeader (Header name value) (HeaderMap m) = HeaderMap $ Map.alter f name m
 --   where
@@ -130,7 +146,7 @@ type family HeaderRenderingResult (f :: HeaderCardinality) :: Type where
 -- because many headers can be used in both requests and responses.
 --
 -- For headers with different semantics in requests and responses, you should
--- either use newtype wrappers or perform additional validation in your 
+-- either use newtype wrappers or perform additional validation in your
 -- application logic.
 --
 -- When defining a new instance, you should generally use a newtype wrapper
