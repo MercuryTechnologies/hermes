@@ -27,6 +27,9 @@ library
   exposed-modules:
       Data.ByteString.Defragmented
       Foreign.Marshall.Mimalloc
+      Network.H2O
+      Network.H2O.Core
+      Network.H2O.Types
       Network.HTTP.ContentCoding
       Network.HTTP.ContentNegotiation
       Network.HTTP.Headers
@@ -108,8 +111,10 @@ library
       cbits/mimalloc/include
   c-sources:
       cbits/mimalloc/src/static.c
+  extra-libraries: h2o
   build-depends:
       MonadRandom
+    , async
     , base >=4.7 && <5
     , binary
     , bitvec
@@ -127,12 +132,14 @@ library
     , mono-traversable
     , network >=3.1.2.1
     , parser-combinators
+    , stm
     , symbolize
     , template-haskell
     , text
     , text-short
     , time
     , transformers
+    , unix
     , unordered-containers
     , validation
     , vector
@@ -194,10 +201,41 @@ executable simple-server-example
     , wai
   default-language: Haskell2010
 
+executable simple-h2o-server
+  main-is: SimpleH2OServer.hs
+  other-modules:
+      Paths_hermes
+  autogen-modules:
+      Paths_hermes
+  hs-source-dirs:
+      examples
+  default-extensions:
+      DataKinds
+      DeriveGeneric
+      DerivingStrategies
+      FlexibleInstances
+      GADTs
+      GeneralizedNewtypeDeriving
+      LambdaCase
+      NumericUnderscores
+      OverloadedStrings
+      RankNTypes
+      ScopedTypeVariables
+      TypeApplications
+      TypeFamilies
+  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints
+  build-depends:
+      async
+    , base >=4.7 && <5
+    , bytestring
+    , hermes
+  default-language: Haskell2010
+
 test-suite hermes-test
   type: exitcode-stdio-1.0
   main-is: Spec.hs
   other-modules:
+      Network.H2O.BasicSpec
       Network.HTTP.Headers.AgeSpec
       Network.HTTP.Headers.AuthorizationSpec
       Network.HTTP.Headers.CacheControlSpec
@@ -229,6 +267,7 @@ test-suite hermes-test
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       MonadRandom
+    , async
     , base >=4.7 && <5
     , binary
     , bitvec
@@ -253,6 +292,7 @@ test-suite hermes-test
     , parser-combinators
     , symbolize
     , template-haskell
+    , temporary
     , text
     , text-short
     , time
@@ -267,6 +307,7 @@ benchmark hermes-bench
   type: exitcode-stdio-1.0
   main-is: Bench.hs
   other-modules:
+      Network.H2O.BenchmarkSpec
       Paths_hermes
   autogen-modules:
       Paths_hermes
@@ -289,6 +330,7 @@ benchmark hermes-bench
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -threaded -rtsopts -with-rtsopts=-N
   build-depends:
       MonadRandom
+    , async
     , base >=4.7 && <5
     , binary
     , bitvec

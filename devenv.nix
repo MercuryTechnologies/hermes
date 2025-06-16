@@ -8,6 +8,7 @@
   packages =
     [ pkgs.git
       pkgs.mimalloc
+      pkgs.h2o
     ];
 
   # https://devenv.sh/languages/

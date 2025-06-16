@@ -31,6 +31,9 @@ import Network.HTTP.ContentNegotiation
 import Network.HTTP.Headers.Authorization (Credentials(..))
 import Data.Word (Word32)
 
+-- Import H2O benchmarks
+import qualified Network.H2O.BenchmarkSpec as H2O
+
 -- Sample data for benchmarks
 sampleTime :: IO UTCTime
 sampleTime = getCurrentTime
@@ -260,96 +263,98 @@ main = do
   sunsetMedium <- Sunset <$> sampleTimeMedium
   sunsetLong <- Sunset <$> sampleTimeLong
 
-  defaultMain
-    [ bgroup "Accept"
-      [ benchHeader "short" sampleAcceptShort
-      , benchHeader "medium" sampleAcceptMedium
-      , benchHeader "long" sampleAcceptLong
+  defaultMain $
+    [ bgroup "HTTP Headers"
+      [ bgroup "Accept"
+        [ benchHeader "short" sampleAcceptShort
+        , benchHeader "medium" sampleAcceptMedium
+        , benchHeader "long" sampleAcceptLong
+        ]
+      , bgroup "Accept-Encoding"
+        [ benchHeader "short" sampleAcceptEncodingShort
+        , benchHeader "medium" sampleAcceptEncodingMedium
+        , benchHeader "long" sampleAcceptEncodingLong
+        ]
+      , bgroup "Age"
+        [ benchHeader "short" sampleAgeShort
+        , benchHeader "medium" sampleAgeMedium
+        , benchHeader "long" sampleAgeLong
+        ]
+      , bgroup "Authorization"
+        [ benchHeader "short" sampleAuthorizationShort
+        , benchHeader "medium" sampleAuthorizationMedium
+        , benchHeader "long" sampleAuthorizationLong
+        ]
+      , bgroup "Cache-Control"
+        [ benchHeader "short" sampleCacheControlShort
+        , benchHeader "medium" sampleCacheControlMedium
+        , benchHeader "long" sampleCacheControlLong
+        ]
+      , bgroup "Content-Encoding"
+        [ benchHeader "short" sampleContentEncodingShort
+        , benchHeader "medium" sampleContentEncodingMedium
+        , benchHeader "long" sampleContentEncodingLong
+        ]
+      , bgroup "Content-Length"
+        [ benchHeader "short" sampleContentLengthShort
+        , benchHeader "medium" sampleContentLengthMedium
+        , benchHeader "long" sampleContentLengthLong
+        ]
+      , bgroup "Content-Type"
+        [ benchHeader "short" sampleContentTypeShort
+        , benchHeader "medium" sampleContentTypeMedium
+        , benchHeader "long" sampleContentTypeLong
+        ]
+      , bgroup "Expires"
+        [ benchHeader "short" (pure expiresShort)
+        , benchHeader "medium" (pure expiresMedium)
+        , benchHeader "long" (pure expiresLong)
+        ]
+      , bgroup "If-Modified-Since"
+        [ benchHeader "short" (pure ifModifiedSinceShort)
+        , benchHeader "medium" (pure ifModifiedSinceMedium)
+        , benchHeader "long" (pure ifModifiedSinceLong)
+        ]
+      , bgroup "If-Unmodified-Since"
+        [ benchHeader "short" (pure ifUnmodifiedSinceShort)
+        , benchHeader "medium" (pure ifUnmodifiedSinceMedium)
+        , benchHeader "long" (pure ifUnmodifiedSinceLong)
+        ]
+      , bgroup "Last-Modified"
+        [ benchHeader "short" (pure lastModifiedShort)
+        , benchHeader "medium" (pure lastModifiedMedium)
+        , benchHeader "long" (pure lastModifiedLong)
+        ]
+      , bgroup "Location"
+        [ benchHeader "short" sampleLocationShort
+        , benchHeader "medium" sampleLocationMedium
+        , benchHeader "long" sampleLocationLong
+        ]
+      , bgroup "Ping-From"
+        [ benchHeader "short" samplePingFromShort
+        , benchHeader "medium" samplePingFromMedium
+        , benchHeader "long" samplePingFromLong
+        ]
+      , bgroup "Proxy-Authorization"
+        [ benchHeader "short" sampleProxyAuthorizationShort
+        , benchHeader "medium" sampleProxyAuthorizationMedium
+        , benchHeader "long" sampleProxyAuthorizationLong
+        ]
+      , bgroup "Referer"
+        [ benchHeader "short" sampleRefererShort
+        , benchHeader "medium" sampleRefererMedium
+        , benchHeader "long" sampleRefererLong
+        ]
+      , bgroup "Sunset"
+        [ benchHeader "short" (pure sunsetShort)
+        , benchHeader "medium" (pure sunsetMedium)
+        , benchHeader "long" (pure sunsetLong)
+        ]
+      , bgroup "Transfer-Encoding"
+        [ benchHeader "short" sampleTransferEncodingShort
+        , benchHeader "medium" sampleTransferEncodingMedium
+        , benchHeader "long" sampleTransferEncodingLong
+        ]
       ]
-    , bgroup "Accept-Encoding"
-      [ benchHeader "short" sampleAcceptEncodingShort
-      , benchHeader "medium" sampleAcceptEncodingMedium
-      , benchHeader "long" sampleAcceptEncodingLong
-      ]
-    , bgroup "Age"
-      [ benchHeader "short" sampleAgeShort
-      , benchHeader "medium" sampleAgeMedium
-      , benchHeader "long" sampleAgeLong
-      ]
-    , bgroup "Authorization"
-      [ benchHeader "short" sampleAuthorizationShort
-      , benchHeader "medium" sampleAuthorizationMedium
-      , benchHeader "long" sampleAuthorizationLong
-      ]
-    , bgroup "Cache-Control"
-      [ benchHeader "short" sampleCacheControlShort
-      , benchHeader "medium" sampleCacheControlMedium
-      , benchHeader "long" sampleCacheControlLong
-      ]
-    , bgroup "Content-Encoding"
-      [ benchHeader "short" sampleContentEncodingShort
-      , benchHeader "medium" sampleContentEncodingMedium
-      , benchHeader "long" sampleContentEncodingLong
-      ]
-    , bgroup "Content-Length"
-      [ benchHeader "short" sampleContentLengthShort
-      , benchHeader "medium" sampleContentLengthMedium
-      , benchHeader "long" sampleContentLengthLong
-      ]
-    , bgroup "Content-Type"
-      [ benchHeader "short" sampleContentTypeShort
-      , benchHeader "medium" sampleContentTypeMedium
-      , benchHeader "long" sampleContentTypeLong
-      ]
-    , bgroup "Expires"
-      [ benchHeader "short" (pure expiresShort)
-      , benchHeader "medium" (pure expiresMedium)
-      , benchHeader "long" (pure expiresLong)
-      ]
-    , bgroup "If-Modified-Since"
-      [ benchHeader "short" (pure ifModifiedSinceShort)
-      , benchHeader "medium" (pure ifModifiedSinceMedium)
-      , benchHeader "long" (pure ifModifiedSinceLong)
-      ]
-    , bgroup "If-Unmodified-Since"
-      [ benchHeader "short" (pure ifUnmodifiedSinceShort)
-      , benchHeader "medium" (pure ifUnmodifiedSinceMedium)
-      , benchHeader "long" (pure ifUnmodifiedSinceLong)
-      ]
-    , bgroup "Last-Modified"
-      [ benchHeader "short" (pure lastModifiedShort)
-      , benchHeader "medium" (pure lastModifiedMedium)
-      , benchHeader "long" (pure lastModifiedLong)
-      ]
-    , bgroup "Location"
-      [ benchHeader "short" sampleLocationShort
-      , benchHeader "medium" sampleLocationMedium
-      , benchHeader "long" sampleLocationLong
-      ]
-    , bgroup "Ping-From"
-      [ benchHeader "short" samplePingFromShort
-      , benchHeader "medium" samplePingFromMedium
-      , benchHeader "long" samplePingFromLong
-      ]
-    , bgroup "Proxy-Authorization"
-      [ benchHeader "short" sampleProxyAuthorizationShort
-      , benchHeader "medium" sampleProxyAuthorizationMedium
-      , benchHeader "long" sampleProxyAuthorizationLong
-      ]
-    , bgroup "Referer"
-      [ benchHeader "short" sampleRefererShort
-      , benchHeader "medium" sampleRefererMedium
-      , benchHeader "long" sampleRefererLong
-      ]
-    , bgroup "Sunset"
-      [ benchHeader "short" (pure sunsetShort)
-      , benchHeader "medium" (pure sunsetMedium)
-      , benchHeader "long" (pure sunsetLong)
-      ]
-    , bgroup "Transfer-Encoding"
-      [ benchHeader "short" sampleTransferEncodingShort
-      , benchHeader "medium" sampleTransferEncodingMedium
-      , benchHeader "long" sampleTransferEncodingLong
-      ]
-    ]
+    ] ++ H2O.benchmarks
 
