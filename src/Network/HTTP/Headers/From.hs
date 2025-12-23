@@ -24,18 +24,20 @@ module Network.HTTP.Headers.From
   ) where
 
 import qualified Data.List.NonEmpty as NE
-import qualified Data.Text.Short as ST
 import qualified Mason.Builder as M
 import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hFrom)
 import Network.HTTP.Headers.Parsing.Util
-import Network.HTTP.Headers.Rendering.Util (shortText)
+import Network.Mailbox
 
 -- | The From header value containing an email address.
 --
 -- Per RFC 9110: The From header field contains an Internet email address
 -- for a human user who controls the requesting user agent.
-newtype From = From { fromMailbox :: ST.ShortText }
+--
+-- The 'Mailbox' type supports both simple addresses (@user\@example.com@)
+-- and addresses with display names (@John Doe \<user\@example.com\>@).
+newtype From = From { fromMailbox :: Mailbox }
   deriving stock (Eq, Show)
 
 instance KnownHeader From where
@@ -53,54 +55,10 @@ instance KnownHeader From where
 
   headerName _ = hFrom
 
--- | Parse the From header value.
---
--- Per RFC 5322, a mailbox is:
--- @
--- mailbox = name-addr / addr-spec
--- addr-spec = local-part "@" domain
--- @
---
--- We use a liberal parser that accepts the raw text rather than
--- fully validating the complex RFC 5322 mailbox grammar.
+-- | Parse the From header value using the RFC 5322 mailbox parser.
 fromParser :: ParserT st String From
 fromParser = From <$> mailboxParser
 
--- | Liberal mailbox parser that accepts common email address formats.
--- We require at least an '@' character for basic email validation.
-mailboxParser :: ParserT st String ST.ShortText
-mailboxParser = do
-  ows
-  addr <- parseEmailAddr
-  ows
-  pure addr
-  where
-    parseEmailAddr = do
-      -- Try to parse angle-bracketed address first (name-addr form)
-      -- e.g., "John Doe <john@example.com>"
-      (skipToAngleBracket *> angleBracketedAddr) <|> addrSpec
-
-    -- Skip display name until we hit '<'
-    skipToAngleBracket = skipMany (skipSatisfyAscii (\c -> c /= '<' && c /= '\r' && c /= '\n'))
-
-    -- Parse <addr-spec>
-    angleBracketedAddr = do
-      $(char '<')
-      addr <- addrSpec
-      $(char '>')
-      pure addr
-
-    -- Parse a bare addr-spec (local-part@domain)
-    addrSpec = do
-      result <- shortASCIIFromParser_ $ some (satisfyAscii isAddrChar)
-      -- Validate that it contains an '@'
-      if ST.any (== '@') result
-        then pure result
-        else err "Email address must contain '@'"
-
-    -- Characters valid in an email address (liberal interpretation)
-    isAddrChar c = c /= ' ' && c /= '\t' && c /= '<' && c /= '>' &&
-                   c /= '\r' && c /= '\n' && c /= '(' && c /= ')'
-
+-- | Render the From header value.
 renderFrom :: From -> M.Builder
-renderFrom (From mailbox) = shortText mailbox
+renderFrom (From mailbox) = renderMailbox mailbox
