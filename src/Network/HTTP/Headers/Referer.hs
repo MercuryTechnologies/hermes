@@ -1,20 +1,38 @@
+{-# LANGUAGE TemplateHaskell #-}
+-- | The Referer header field per RFC 9110 Section 10.1.3.
+--
+-- The "Referer" header field allows the user agent to specify a
+-- URI reference for the resource from which the target URI was
+-- obtained (i.e., the "referrer", though the field name is
+-- misspelled).
+--
+-- @
+-- Referer = absolute-URI / partial-URI
+-- @
 module Network.HTTP.Headers.Referer
   ( Referer (..)
   , refererParser
   , renderReferer
   ) where
 
-import qualified Data.ByteString as B
 import qualified Data.List.NonEmpty as NE
-import qualified Data.Text.Short as ST
 import qualified Mason.Builder as M
 import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hReferer)
 import Network.HTTP.Headers.Parsing.Util
-import Network.HTTP.Headers.Rendering.Util (shortText)
+import Network.URI
 
--- | Referer header value containing the referring URI
-newtype Referer = Referer { refererUri :: ST.ShortText }
+-- | Referer header value containing the referring URI.
+--
+-- The URI is parsed according to RFC 3986 and supports:
+--
+-- * Absolute URIs: @https://example.com/path@
+-- * Partial URIs: @/path/to/resource@
+-- * Internationalized domain names (IDN/Punycode)
+--
+-- Note: The header name is intentionally misspelled as per the original
+-- HTTP specification (should be "Referrer").
+newtype Referer = Referer { refererUri :: URI }
   deriving stock (Eq, Show)
 
 instance KnownHeader Referer where
@@ -35,7 +53,7 @@ instance KnownHeader Referer where
   headerName _ = hReferer
 
 refererParser :: ParserT st String Referer
-refererParser = Referer <$> takeRestShortText
+refererParser = Referer <$> uriReferenceParser
 
 renderReferer :: Referer -> M.Builder
-renderReferer (Referer uri) = shortText uri
+renderReferer (Referer uri) = renderURI uri

@@ -1,20 +1,35 @@
+{-# LANGUAGE TemplateHaskell #-}
+-- | The Location header field per RFC 9110 Section 10.2.2.
+--
+-- The "Location" header field is used in some responses to refer to a
+-- specific resource in relation to the response. The type of
+-- relationship is defined by the combination of request method and
+-- status code semantics.
+--
+-- @
+-- Location = URI-reference
+-- @
 module Network.HTTP.Headers.Location
   ( Location (..)
   , locationParser
   , renderLocation
   ) where
 
-import qualified Data.ByteString as B
 import qualified Data.List.NonEmpty as NE
-import qualified Data.Text.Short as ST
 import qualified Mason.Builder as M
 import Network.HTTP.Headers
 import Network.HTTP.Headers.HeaderFieldName (hLocation)
 import Network.HTTP.Headers.Parsing.Util
-import Network.HTTP.Headers.Rendering.Util (shortText)
+import Network.URI
 
--- | Location header value containing a URI
-newtype Location = Location { locationUri :: ST.ShortText }
+-- | Location header value containing a URI-reference.
+--
+-- The URI is parsed according to RFC 3986 and supports:
+--
+-- * Absolute URIs: @https://example.com/path@
+-- * Relative references: @/path/to/resource@
+-- * Internationalized domain names (IDN/Punycode)
+newtype Location = Location { locationUri :: URI }
   deriving stock (Eq, Show)
 
 instance KnownHeader Location where
@@ -35,7 +50,7 @@ instance KnownHeader Location where
   headerName _ = hLocation
 
 locationParser :: ParserT st String Location
-locationParser = Location <$> takeRestShortText
+locationParser = Location <$> uriReferenceParser
 
 renderLocation :: Location -> M.Builder
-renderLocation (Location uri) = shortText uri
+renderLocation (Location uri) = renderURI uri
