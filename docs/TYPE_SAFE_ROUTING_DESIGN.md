@@ -1343,45 +1343,321 @@ instance Backend HTTP2Backend where
 data QUICBackend = QUICBackend
 ```
 
-### 10.5 Performance Optimizations
+### 10.5 Performance Optimizations & Allocation Reduction
+
+Hermes prioritizes low-allocation, cache-friendly designs. This section details
+strategies for minimizing GC pressure and maximizing throughput.
+
+#### 10.5.1 Off-Heap and Compact Regions
 
 ```haskell
--- | Zero-copy header access
--- Headers are stored with interned names, enabling O(1) comparison
-lookupHeaderFast :: HeaderFieldName -> HeaderMap -> Maybe (NonEmpty ByteString)
-lookupHeaderFast name (HeaderMap m) = Map.lookup name m  -- Symbol comparison is pointer equality
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 
--- | Pre-computed common headers for responses
-commonResponseHeaders :: HeaderMap
-commonResponseHeaders = headerMapFromList
-  [ (hServer, "Hermes")
-  , (hConnection, "keep-alive")
-  ]
-{-# NOINLINE commonResponseHeaders #-}
+import GHC.Compact
+import GHC.Prim
+import GHC.Types
 
--- | Efficient header map merging
-mergeHeaders :: HeaderMap -> HeaderMap -> HeaderMap
-mergeHeaders (HeaderMap a) (HeaderMap b) = HeaderMap (Map.unionWith (<>) a b)
-
--- | Builder-based response construction (no intermediate ByteStrings)
-buildResponse :: Response -> Builder
-buildResponse Response{..} = mconcat
-  [ statusLineBuilder responseStatus
-  , headersBuilder responseHeaders
-  , crlfBuilder
-  , case responseBody of
-      BuilderBody b -> b
-      _ -> mempty  -- Streaming handled separately
-  ]
-
--- | Memory-mapped file responses
-data FilePart = FilePart
-  { filePartOffset :: {-# UNPACK #-} !Int64
-  , filePartLength :: {-# UNPACK #-} !Int64
+-- | Long-lived routing tables stored in compact regions
+-- Compact regions are not traversed by GC, reducing pause times
+data CompactRoutes = CompactRoutes
+  { compactTrie    :: !(Compact (RouteTrie Handler))
+  , compactStatic  :: !(Compact StaticFileMap)
   }
 
--- | Sendfile support (when available)
-responseFileSendfile :: StatusCode -> HeaderMap -> FilePath -> Maybe FilePart -> Response
+-- | Build compact routes at startup (one-time cost)
+mkCompactRoutes :: RouteTrie Handler -> StaticFileMap -> IO CompactRoutes
+mkCompactRoutes trie static = CompactRoutes
+  <$> compact trie
+  <*> compact static
+
+-- | Access compact data (no copying, pointer into compact region)
+lookupRoute :: CompactRoutes -> Method -> Path -> Maybe Handler
+lookupRoute cr method path = matchTrie (getCompact $ compactTrie cr) method path
+
+-- | Pinned ByteArrays for headers (avoid copying when sending)
+data PinnedByteArray = PinnedByteArray
+  { pbaArray  :: !(MutableByteArray# RealWorld)
+  , pbaLength :: {-# UNPACK #-} !Int
+  }
+
+-- | Allocate pinned memory for response headers
+-- Pinned memory can be passed directly to sendmsg() without copying
+allocPinnedHeaders :: Int -> IO PinnedByteArray
+allocPinnedHeaders size = IO $ \s ->
+  case newPinnedByteArray# size s of
+    (# s', arr #) -> (# s', PinnedByteArray arr size #)
+
+-- | Write headers directly to pinned buffer
+renderHeadersToPinned :: HeaderMap -> PinnedByteArray -> IO Int
+renderHeadersToPinned headers pba = do
+  -- Write directly to pinned memory, return bytes written
+  foldM writeHeader 0 (toHeaderList headers)
+  where
+    writeHeader offset (name, value) = do
+      -- Direct memory writes, no intermediate allocations
+      copyToByteArray pba offset (headerNameBytes name)
+      ...
+```
+
+#### 10.5.2 Buffer Pools and Recycling
+
+```haskell
+-- | Pool of reusable buffers to avoid allocation per-request
+data BufferPool = BufferPool
+  { poolSmall  :: !(Pool SmallBuffer)   -- 4KB buffers for headers
+  , poolMedium :: !(Pool MediumBuffer)  -- 64KB buffers for bodies
+  , poolLarge  :: !(Pool LargeBuffer)   -- 1MB buffers for uploads
+  }
+
+newtype SmallBuffer = SmallBuffer (MutableByteArray RealWorld)
+newtype MediumBuffer = MediumBuffer (MutableByteArray RealWorld)
+newtype LargeBuffer = LargeBuffer (MutableByteArray RealWorld)
+
+-- | Acquire a buffer, use it, release it back
+withSmallBuffer :: BufferPool -> (SmallBuffer -> IO a) -> IO a
+withSmallBuffer pool action = bracket
+  (acquireBuffer $ poolSmall pool)
+  (releaseBuffer $ poolSmall pool)
+  action
+
+-- | Request processing with buffer reuse
+processRequest :: BufferPool -> Socket -> IO Response
+processRequest pool sock = do
+  withSmallBuffer pool $ \headerBuf -> do
+    -- Read headers into pooled buffer (no allocation)
+    bytesRead <- recvBuf sock (bufferPtr headerBuf) 4096
+    headers <- parseHeadersFromBuffer headerBuf bytesRead
+    ...
+
+-- | Thread-local buffer cache for even lower contention
+data ThreadLocalBuffers = ThreadLocalBuffers
+  { tlbHeaderBuffer :: {-# UNPACK #-} !(IORef (Maybe SmallBuffer))
+  , tlbBodyBuffer   :: {-# UNPACK #-} !(IORef (Maybe MediumBuffer))
+  }
+
+-- | Get or allocate thread-local buffer
+getThreadLocalHeader :: ThreadLocalBuffers -> IO SmallBuffer
+getThreadLocalHeader tlb = do
+  mBuf <- readIORef (tlbHeaderBuffer tlb)
+  case mBuf of
+    Just buf -> pure buf  -- Reuse existing
+    Nothing -> do
+      buf <- allocSmallBuffer
+      writeIORef (tlbHeaderBuffer tlb) (Just buf)
+      pure buf
+```
+
+#### 10.5.3 Zero-Copy Path and Query Parsing
+
+```haskell
+-- | Path that references original request buffer (no copying)
+data ZeroCopyPath = ZeroCopyPath
+  { zcpSource   :: {-# UNPACK #-} !ByteString  -- Original buffer (kept alive)
+  , zcpSegments :: {-# UNPACK #-} !(SmallArray PathSegment)
+  }
+
+-- | Path segment as offset+length into source (no allocation per segment)
+data PathSegment = PathSegment
+  { psOffset :: {-# UNPACK #-} !Int16
+  , psLength :: {-# UNPACK #-} !Int16
+  }
+
+-- | Parse path without allocating per-segment ByteStrings
+parsePathZeroCopy :: ByteString -> ZeroCopyPath
+parsePathZeroCopy bs = ZeroCopyPath bs segments
+  where
+    segments = runST $ do
+      arr <- newSmallArray maxSegments undefined
+      let go !i !offset
+            | offset >= BS.length bs = freezeSmallArray arr 0 i
+            | otherwise = do
+                let nextSlash = fromMaybe (BS.length bs) $
+                      BS.elemIndex '/' (BS.drop offset bs)
+                writeSmallArray arr i (PathSegment (fromIntegral offset)
+                                                   (fromIntegral $ nextSlash - offset))
+                go (i + 1) (nextSlash + 1)
+      go 0 1  -- Skip leading /
+
+-- | Get segment text (allocates only when needed, e.g., for capture parsing)
+getSegment :: ZeroCopyPath -> Int -> ByteString
+getSegment (ZeroCopyPath src segs) i =
+  let PathSegment off len = indexSmallArray segs i
+  in BS.take (fromIntegral len) $ BS.drop (fromIntegral off) src
+{-# INLINE getSegment #-}
+
+-- | Match static segment without allocation (compare in-place)
+matchSegment :: ZeroCopyPath -> Int -> ByteString -> Bool
+matchSegment zcp i expected =
+  let PathSegment off len = indexSmallArray (zcpSegments zcp) i
+      actual = BS.take (fromIntegral len) $ BS.drop (fromIntegral off) (zcpSource zcp)
+  in actual == expected
+{-# INLINE matchSegment #-}
+```
+
+#### 10.5.4 Interning and Deduplication
+
+```haskell
+-- | Hermes uses symbolize for O(1) header name comparison
+-- Header names are interned at startup, pointer equality thereafter
+
+-- | Extended interning for common header values
+data InternedValues = InternedValues
+  { ivContentTypes :: !(HashMap ByteString Symbol)  -- "application/json" etc.
+  , ivMethods      :: !(HashMap ByteString Method)  -- Pre-interned methods
+  , ivStatusLines  :: !(SmallArray Builder)         -- Pre-built "HTTP/1.1 200 OK\r\n"
+  }
+
+-- | Global interned values (initialized once)
+internedValues :: InternedValues
+internedValues = unsafePerformIO mkInternedValues
+{-# NOINLINE internedValues #-}
+
+mkInternedValues :: IO InternedValues
+mkInternedValues = do
+  cts <- mapM internContentType commonContentTypes
+  InternedValues
+    <$> pure (Map.fromList cts)
+    <*> pure internedMethods
+    <*> mkStatusLines
+
+-- | Pre-built status lines (avoid repeated formatting)
+mkStatusLines :: IO (SmallArray Builder)
+mkStatusLines = do
+  arr <- newSmallArray 600 mempty
+  forM_ [100..599] $ \code ->
+    writeSmallArray arr code (buildStatusLine code)
+  freezeSmallArray arr 0 600
+
+-- | O(1) status line lookup
+statusLineBuilder :: StatusCode -> Builder
+statusLineBuilder (StatusCode code) =
+  indexSmallArray (ivStatusLines internedValues) (fromIntegral code)
+{-# INLINE statusLineBuilder #-}
+```
+
+#### 10.5.5 Unboxed and Unpacked Data
+
+```haskell
+{-# LANGUAGE UnboxedSums #-}
+{-# LANGUAGE UnboxedTuples #-}
+
+-- | Route match result without boxing
+type RouteMatchResult# = (# (# #) | Handler | Rejection #)
+  -- (# (# #) | ... #) is unboxed Maybe - no allocation for Nothing
+
+-- | Unboxed path matching
+matchPath# :: RouteTrie -> Path -> Int -> RouteMatchResult#
+matchPath# trie path idx
+  | idx >= pathLength path = case trieHandler trie of
+      Nothing -> (# (# #) | | #)
+      Just h  -> (# | h | #)
+  | otherwise = ...
+
+-- | Unboxed pair for captures (avoid tuple allocation)
+data CaptureResult = CaptureResult
+  { crValue  :: {-# UNPACK #-} !Text
+  , crNextIdx :: {-# UNPACK #-} !Int
+  }
+
+-- | Use unlifted newtypes where possible (GHC 9.2+)
+type StatusCode# = Word16#
+
+mkStatus# :: Word16 -> StatusCode#
+mkStatus# (W16# w) = w
+{-# INLINE mkStatus# #-}
+```
+
+#### 10.5.6 Builder Fusion
+
+```haskell
+-- | Fused header rendering (single pass, no intermediate structures)
+renderHeaders :: HeaderMap -> Builder
+renderHeaders = Map.foldMapWithKey renderHeader
+  where
+    renderHeader name values = foldMap (renderSingleHeader name) values
+    {-# INLINE renderHeader #-}
+
+    renderSingleHeader :: HeaderFieldName -> ByteString -> Builder
+    renderSingleHeader name value =
+      headerNameBuilder name <> colonSpace <> byteString value <> crlf
+    {-# INLINE renderSingleHeader #-}
+
+-- | Pre-allocated small builders (avoid thunk allocation)
+colonSpace, crlf :: Builder
+colonSpace = shortByteString ": "
+crlf = shortByteString "\r\n"
+{-# NOINLINE colonSpace #-}
+{-# NOINLINE crlf #-}
+
+-- | Use shortByteString for small literals (stored inline, no pointer)
+statusOK :: Builder
+statusOK = shortByteString "HTTP/1.1 200 OK\r\n"
+{-# INLINE statusOK #-}
+```
+
+#### 10.5.7 Request Recycling
+
+```haskell
+-- | Mutable request structure for reuse across keep-alive connections
+data MutableRequest s = MutableRequest
+  { mrMethod      :: !(STRef s Method)
+  , mrPath        :: !(STRef s ZeroCopyPath)
+  , mrHeaders     :: !(MutableHeaderMap s)
+  , mrBodyBuffer  :: !(MutableByteArray s)
+  }
+
+-- | Process multiple requests on same connection with request recycling
+handleKeepAlive :: Socket -> MutableRequest RealWorld -> IO ()
+handleKeepAlive sock mreq = loop
+  where
+    loop = do
+      -- Parse into mutable request (reuses buffers)
+      eof <- parseRequestInto sock mreq
+      unless eof $ do
+        -- Freeze for handler (cheap, just wraps mutable)
+        req <- freezeRequest mreq
+        resp <- handleRequest req
+        sendResponse sock resp
+        -- Reset for next request (no deallocation)
+        resetMutableRequest mreq
+        loop
+
+-- | Freeze mutable request (O(1), shares underlying memory)
+freezeRequest :: MutableRequest RealWorld -> IO Request
+freezeRequest MutableRequest{..} = do
+  method <- readSTRef mrMethod
+  path <- readSTRef mrPath
+  headers <- unsafeFreezeHeaderMap mrHeaders
+  pure $ Request method path headers ...
+```
+
+### 10.5.8 Memory Layout Optimization
+
+```haskell
+-- | Cache-line aligned request context (64 bytes on most systems)
+data RequestContext = RequestContext
+  { rcRequest     :: {-# UNPACK #-} !Request      -- Hot: accessed every request
+  , rcPathIndex   :: {-# UNPACK #-} !Int          -- Hot: updated during routing
+  , rcMethod      :: {-# UNPACK #-} !Method       -- Hot: checked early
+  , rcTracing     :: !(Maybe TracingContext)      -- Cold: only if tracing enabled
+  , rcSettings    :: !RouteSettings               -- Cold: rarely accessed
+  }
+
+-- | Ensure hot fields are in same cache line
+-- Use GHC's inspection-testing to verify layout
+{-# ANN type RequestContext (CacheLineAligned 64) #-}
+
+-- | Small, unboxed rejection type (fits in registers)
+data Rejection
+  = RejPath
+  | RejMethod {-# UNPACK #-} !Method
+  | RejHeader {-# UNPACK #-} !HeaderFieldName
+  | RejAuth
+  deriving (Eq)
+
+-- | Use SmallArray for small collections (better cache locality than lists)
+type Headers = SmallArray (HeaderFieldName, ByteString)
 ```
 
 ### 10.6 Streaming Primitives
@@ -1926,6 +2202,293 @@ renderTrace trace = T.unlines $
   ]
 ```
 
+### 12.9 Rewrite Rules and Fusion for Resources
+
+GHC rewrite rules enable zero-cost abstractions by eliminating intermediate
+structures at compile time. This is especially valuable for the decision tree
+where naive implementations would allocate per-decision.
+
+#### 12.9.1 Decision Fusion
+
+```haskell
+{-# LANGUAGE RankNTypes #-}
+
+-- | Representation for fusion: CPS-style decisions
+newtype DecisionM m a = DecisionM
+  { runDecisionM :: forall r.
+      (a -> m r)           -- Continue
+      -> (Response -> m r) -- Short-circuit
+      -> m r
+  }
+
+instance Functor (DecisionM m) where
+  fmap f (DecisionM g) = DecisionM $ \cont short ->
+    g (cont . f) short
+  {-# INLINE fmap #-}
+
+instance Applicative (DecisionM m) where
+  pure a = DecisionM $ \cont _ -> cont a
+  {-# INLINE pure #-}
+  DecisionM f <*> DecisionM a = DecisionM $ \cont short ->
+    f (\fab -> a (\x -> cont (fab x)) short) short
+  {-# INLINE (<*>) #-}
+
+instance Monad (DecisionM m) where
+  DecisionM m >>= f = DecisionM $ \cont short ->
+    m (\a -> runDecisionM (f a) cont short) short
+  {-# INLINE (>>=) #-}
+
+-- | Short-circuit with response
+shortCircuit :: Response -> DecisionM m a
+shortCircuit resp = DecisionM $ \_ short -> short resp
+{-# INLINE shortCircuit #-}
+
+-- | Lift an action
+liftDecision :: Monad m => m a -> DecisionM m a
+liftDecision ma = DecisionM $ \cont _ -> ma >>= cont
+{-# INLINE liftDecision #-}
+
+-- | RULE: Fuse consecutive decisions
+{-# RULES
+"decision/bind-assoc" forall m f g.
+  (m >>= f) >>= g = m >>= (\x -> f x >>= g)
+
+"decision/pure-bind" forall a f.
+  pure a >>= f = f a
+
+"decision/bind-pure" forall m.
+  m >>= pure = m
+
+"decision/fmap-pure" forall f a.
+  fmap f (pure a) = pure (f a)
+#-}
+```
+
+#### 12.9.2 Resource Field Fusion
+
+```haskell
+-- | Build resource with static analysis opportunities
+data ResourceBuilder m = ResourceBuilder
+  { rbServiceAvailable :: First (m Bool)
+  , rbAllowedMethods   :: First (m [Method])
+  , rbExists           :: First (m Bool)
+  , rbContentTypes     :: First (m [(MediaType, m ResponseBody)])
+  -- ... other fields as First to enable Monoid-based merging
+  }
+
+instance Semigroup (ResourceBuilder m) where
+  a <> b = ResourceBuilder
+    { rbServiceAvailable = rbServiceAvailable a <> rbServiceAvailable b
+    , rbAllowedMethods = rbAllowedMethods a <> rbAllowedMethods b
+    -- ...
+    }
+
+-- | RULE: Fuse resource building
+{-# RULES
+"resource/mempty-left" forall r.
+  mempty <> r = r
+
+"resource/mempty-right" forall r.
+  r <> mempty = r
+
+"resource/assoc" forall a b c.
+  (a <> b) <> c = a <> (b <> c)
+#-}
+
+-- | Finalize resource (fuses all overrides)
+finalizeResource :: Applicative m => ResourceBuilder m -> Resource m
+finalizeResource rb = defaultResource
+  { resourceServiceAvailable = fromMaybe (pure True) $ getFirst $ rbServiceAvailable rb
+  , resourceAllowedMethods = fromMaybe (pure [mGet, mHead]) $ getFirst $ rbAllowedMethods rb
+  -- ...
+  }
+{-# INLINE finalizeResource #-}
+```
+
+#### 12.9.3 Decision Tree Specialization
+
+```haskell
+-- | Specialize decision tree based on resource configuration
+-- If resource always returns True for serviceAvailable, skip that check
+
+class KnownDecision (d :: Bool) where
+  skipDecision :: proxy d -> Bool
+
+instance KnownDecision 'True where
+  skipDecision _ = True
+  {-# INLINE skipDecision #-}
+
+instance KnownDecision 'False where
+  skipDecision _ = False
+  {-# INLINE skipDecision #-}
+
+-- | Type-level resource with known static decisions
+data StaticResource (serviceAvailable :: Bool)
+                    (authRequired :: Bool)
+                    m = StaticResource (Resource m)
+
+-- | RULE: Eliminate static True checks
+{-# RULES
+"decision/service-true" forall r.
+  checkServiceAvailable (StaticResource @'True @auth r) = pure ()
+
+"decision/auth-false" forall r.
+  checkAuthorization (StaticResource @sa @'False r) = pure Authorized
+#-}
+
+-- | Specialize at compile time
+runStaticResource :: forall sa auth m.
+  (KnownDecision sa, KnownDecision auth, Monad m)
+  => StaticResource sa auth m -> Request -> m Response
+runStaticResource (StaticResource res) req = runDecisionM decisions pure id
+  where
+    decisions = do
+      -- These checks are eliminated by RULES when statically known
+      unless (skipDecision (Proxy @sa)) $
+        unlessM (liftDecision $ resourceServiceAvailable res) $
+          shortCircuit response503
+
+      unless (skipDecision (Proxy @auth)) $ do
+        auth <- liftDecision $ resourceIsAuthorized res
+        case auth of
+          Authorized -> pure ()
+          Unauthorized c -> shortCircuit $ response401 c
+
+      -- Continue with remaining decisions
+      ...
+{-# INLINE runStaticResource #-}
+```
+
+#### 12.9.4 Stream Fusion for Response Bodies
+
+```haskell
+-- | Fused stream type (like vector's Bundle)
+data Stream m a = forall s. Stream
+  (s -> m (Step s a))  -- Stepper
+  s                     -- Initial state
+  Size                  -- Size hint
+
+data Step s a
+  = Yield !a !s
+  | Skip !s
+  | Done
+
+-- | RULE: Fuse map/filter chains
+{-# RULES
+"stream/map-map" forall f g s.
+  mapS f (mapS g s) = mapS (f . g) s
+
+"stream/filter-filter" forall p q s.
+  filterS p (filterS q s) = filterS (\x -> p x && q x) s
+
+"stream/map-filter" forall f p s.
+  filterS p (mapS f s) = mapFilterS f p s
+#-}
+
+-- | Fused response body rendering
+renderBodyFused :: ResponseBody -> Stream IO Builder
+renderBodyFused (BuilderBody b) = singleton b
+renderBodyFused (StreamingBody sb) = streamToFused sb
+
+-- | Convert to final ByteString with fusion
+toByteString :: Stream IO Builder -> IO ByteString
+toByteString = foldStream (<>) mempty >=> pure . toLazyByteString
+{-# INLINE toByteString #-}
+```
+
+#### 12.9.5 Inlining Control
+
+```haskell
+-- | Decision functions with carefully controlled inlining
+-- INLINE: Small, hot functions that benefit from specialization
+-- INLINABLE: Functions that should be specializable but not always inlined
+-- NOINLINE: Functions that shouldn't be duplicated (large or cold)
+
+checkServiceAvailable :: Monad m => Resource m -> DecisionM m ()
+checkServiceAvailable res = do
+  available <- liftDecision $ resourceServiceAvailable res
+  unless available $ shortCircuit response503
+{-# INLINE checkServiceAvailable #-}  -- Small, always inline
+
+runContentNegotiation :: Monad m => Resource m -> Request -> DecisionM m NegotiationResult
+runContentNegotiation res req = ...
+{-# INLINABLE runContentNegotiation #-}  -- Specialize per resource, but not tiny
+
+generateErrorResponse :: StatusCode -> Text -> Response
+generateErrorResponse = ...
+{-# NOINLINE generateErrorResponse #-}  -- Cold path, don't duplicate
+
+-- | Phase control for rules
+{-# INLINE [1] mapResource #-}
+{-# INLINE [1] bindResource #-}
+{-# RULES
+"resource/map-bind" [2] forall f g m.
+  mapResource f (bindResource m g) = bindResource m (mapResource f . g)
+#-}
+```
+
+#### 12.9.6 Inspection Testing
+
+```haskell
+-- | Verify fusion happens using inspection-testing
+{-# LANGUAGE TemplateHaskell #-}
+
+import Test.Inspection
+
+-- | This should compile to a single loop with no intermediate allocations
+processResourceFused :: Resource IO -> Request -> IO Response
+processResourceFused res req = runDecisionM (allDecisions res req) pure id
+
+-- | Verify no dictionaries remain (full specialization)
+inspect $ hasNoTypeClasses 'processResourceFused
+
+-- | Verify no allocations in hot path
+inspect $ 'processResourceFused `doesNotUse` 'GHC.Base.build
+inspect $ 'processResourceFused `doesNotUse` 'GHC.Base.foldr
+
+-- | Verify specific rules fired
+inspect $ 'processResourceFused `hasRule` "decision/bind-assoc"
+```
+
+#### 12.9.7 Template Haskell for Static Resources
+
+```haskell
+-- | Generate fully specialized resource handlers at compile time
+mkResource :: Name -> Q [Dec]
+mkResource name = do
+  -- Analyze resource definition
+  info <- reify name
+  let decisions = analyzeResourceDecisions info
+
+  -- Generate specialized code path
+  [d|
+    $(varP $ mkName $ "run_" ++ nameBase name) :: Request -> IO Response
+    $(varP $ mkName $ "run_" ++ nameBase name) = \req -> do
+      $(generateSpecializedDecisions decisions)
+  |]
+
+-- | Generate decision code, eliminating statically-known checks
+generateSpecializedDecisions :: [Decision] -> Q Exp
+generateSpecializedDecisions decisions = do
+  -- Skip checks that are statically True
+  let activeDecisions = filter (not . isStaticallyTrue) decisions
+
+  -- Generate code for remaining decisions
+  foldr chainDecision [| pure |] activeDecisions
+  where
+    chainDecision d rest = [|
+      do result <- $(decisionCode d)
+         case result of
+           Continue -> $rest
+           Respond resp -> pure resp
+      |]
+
+-- | Usage:
+$(mkResource 'userResource)
+-- Generates: run_userResource :: Request -> IO Response
+-- With all static checks eliminated
+```
+
 ---
 
 ## Part 13: OpenTelemetry Tracing
@@ -2457,6 +3020,9 @@ prop_clientServerRoundTrip server = property $ do
 ### Phase 1: HAI Core & Backend Abstraction
 - [ ] Define HAI `Request` type with `HeaderMap`, interned `Method`, efficient `Path`
 - [ ] Define HAI `Response` type with type-safe headers
+- [ ] Zero-copy path parsing (`ZeroCopyPath`, `PathSegment`)
+- [ ] Buffer pools for request/response handling
+- [ ] Pinned memory for sendmsg() optimization
 - [ ] Implement `Backend` type class
 - [ ] Create WAI adapter (`toWaiApp`, `fromWaiApp`)
 - [ ] Port `SimpleServer` to be a HAI backend
@@ -2493,7 +3059,7 @@ prop_clientServerRoundTrip server = property $ do
 - [ ] Authorization helpers
 - [ ] Integration with conditional headers (If-Match, etc.)
 
-### Phase 6: Webmachine Decision Tree
+### Phase 6: Webmachine Decision Tree & Fusion
 - [ ] `Resource` record type with all decision points
 - [ ] `defaultResource` with sensible defaults
 - [ ] Decision tree execution engine
@@ -2501,6 +3067,11 @@ prop_clientServerRoundTrip server = property $ do
 - [ ] Full conditional request handling (RFC 7232)
 - [ ] Content negotiation engine (RFC 7231)
 - [ ] Decision tree tracing/visualization
+- [ ] CPS-style `DecisionM` for fusion
+- [ ] Rewrite rules for decision elimination
+- [ ] `StaticResource` for compile-time specialization
+- [ ] Stream fusion for response bodies
+- [ ] Inspection testing verification
 
 ### Phase 7: Type-Level API & Record-Based Routes
 - [ ] Type-level combinators (`:>`, `:<|>`, `Capture`, etc.)
@@ -2687,6 +3258,11 @@ dependencies:
   # Template Haskell
   - template-haskell # TH for route generation
   - th-lift          # TH lifting utilities
+
+  # Performance & optimization verification
+  - inspection-testing # Verify rewrite rules fire
+  - primitive          # Low-level memory operations
+  - compact            # Compact regions (GHC 8.2+)
 
   # OpenTelemetry
   - hs-opentelemetry-api          # OTel API
