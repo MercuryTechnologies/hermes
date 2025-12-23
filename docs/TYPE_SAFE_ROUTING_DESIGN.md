@@ -78,13 +78,20 @@ We propose a **hybrid approach** that combines the best of both:
 
 ### 1.1 The Route Monad
 
+The routing monad is parameterized by a region type `r` that ensures request data
+cannot escape its scope without explicit copying. This uses ST-style rank-2 types
+for compile-time safety.
+
 ```haskell
+{-# LANGUAGE RankNTypes #-}
+
 -- | The core routing monad, parameterized by:
+--   * 'r' - Region tag (prevents request data escape, like ST's 's')
 --   * 'e' - Error type for route failures
 --   * 'm' - Base monad (typically IO or some effect monad)
 --   * 'a' - Result type
-newtype RouteT e m a = RouteT
-  { unRouteT :: RequestContext -> m (RouteResult e a)
+newtype RouteT r e m a = RouteT
+  { unRouteT :: RequestContext r -> m (RouteResult e a)
   }
   deriving (Functor)
 
@@ -107,12 +114,29 @@ data Rejection e
   deriving (Show, Eq)
 
 -- | Request context passed through the routing tree
-data RequestContext = RequestContext
-  { rcRequest :: !Request         -- ^ The WAI Request
-  , rcUnmatchedPath :: ![Text]    -- ^ Path segments not yet matched
-  , rcHeaders :: !HeaderMap       -- ^ Parsed headers (from Hermes)
+-- The 'r' parameter tags all request data to this region
+data RequestContext r = RequestContext
+  { rcRequest :: !(Request r)     -- ^ Region-scoped request (from HAI)
+  , rcUnmatchedPath :: ![Text]    -- ^ Path segments not yet matched (copied for routing)
+  , rcHeaders :: !(HeaderMap r)   -- ^ Arena-allocated headers
+  , rcArena :: !(Arena r)         -- ^ Arena for temporary allocations
   , rcSettings :: !RouteSettings  -- ^ Configuration
   }
+
+-- | Run a route handler with a request-scoped arena
+-- The rank-2 type ensures nothing tagged with 'r' can escape
+runRouteT :: forall e m a. MonadIO m
+          => RouteSettings
+          -> (forall r. RouteT r e m a)  -- ^ Handler cannot leak 'r'
+          -> RawRequest
+          -> m (Either (Rejection e) a)
+runRouteT settings handler rawReq = withRequestArena defaultArenaSize $ \arena -> do
+  ctx <- parseRequestContext arena rawReq settings
+  result <- unRouteT handler ctx
+  case result of
+    Matched a    -> pure (Right a)
+    Rejected rej -> pure (Left rej)
+    Failed e     -> pure (Left (CustomRejection e))
 ```
 
 ### 1.2 Route Combinators
@@ -1143,125 +1167,204 @@ WAI (Web Application Interface) has served the Haskell ecosystem well, but it ha
 - Tightly coupled to specific representations
 - No compile-time header validation
 - Limited streaming primitives
+- No memory management story for request data lifecycle
 
 Hermes introduces **HAI** (Hermes Application Interface), a next-generation abstraction that:
 - Uses Hermes's efficient `HeaderMap` with interned `HeaderFieldName`
 - Supports multiple backends (WAI adapter, raw sockets, HTTP/2, QUIC)
 - Provides zero-copy operations where possible
 - Enables compile-time header direction checking
+- **Region-based memory management** - request data lives in arenas, preventing use-after-free
+  and enabling bulk deallocation at request end
 
-### 10.1 Core Types
+### 10.1 Core Arena Infrastructure
+
+All request data is allocated in a per-request arena. The region tag `r` ensures
+data cannot escape without explicit copying.
 
 ```haskell
--- | The Hermes Application type - backend agnostic
-type Application = Request -> (Response -> IO ResponseSent) -> IO ResponseSent
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE LinearTypes #-}
+
+-- | Request-scoped arena for zero-copy parsing and allocation
+data Arena r = Arena
+  { arenaPtr      :: {-# UNPACK #-} !(Ptr Word8)
+  , arenaCapacity :: {-# UNPACK #-} !Int
+  , arenaOffset   :: {-# UNPACK #-} !(IORef Int)
+  }
+
+-- | Region-tagged wrapper - data cannot escape its region without copying
+newtype Scoped r a = Scoped { unscoped :: a }
+  deriving (Functor)
+
+-- | Values that can be copied out of a region (deep copy)
+class Copyable a where
+  deepCopy :: a -> IO a
+
+instance Copyable ByteString where
+  deepCopy = pure . BS.copy
+
+instance Copyable Text where
+  deepCopy = pure . T.copy
+
+-- | Escape region by copying - the ONLY way to get data out
+escape :: (MonadIO m, Copyable a) => Scoped r a -> m a
+escape (Scoped a) = liftIO $ deepCopy a
+
+-- | Run with a request-scoped arena (rank-2 prevents escape)
+withRequestArena :: forall a. Int -> (forall r. Arena r -> IO a) -> IO a
+withRequestArena size f = bracket allocArena freeArena f
+  where
+    allocArena = do
+      ptr <- mallocBytes size
+      ref <- newIORef 0
+      pure $ Arena ptr size ref
+    freeArena arena = free (arenaPtr arena)
+
+-- | Allocate ByteString in arena (zero-copy into arena memory)
+arenaByteString :: Arena r -> ByteString -> IO (Scoped r ByteString)
+arenaByteString arena bs = do
+  let len = BS.length bs
+  offset <- readIORef (arenaOffset arena)
+  let newOffset = offset + len
+  when (newOffset > arenaCapacity arena) $
+    throwIO ArenaOverflow
+  writeIORef (arenaOffset arena) newOffset
+  let destPtr = arenaPtr arena `plusPtr` offset
+  BS.useAsCStringLen bs $ \(srcPtr, srcLen) ->
+    copyBytes destPtr (castPtr srcPtr) srcLen
+  fp <- newForeignPtr_ destPtr
+  pure $ Scoped $ BS.fromForeignPtr fp 0 len
+```
+
+### 10.2 Request Type (Region-Scoped)
+
+```haskell
+-- | The Hermes Application type - backend agnostic, region-scoped
+-- The rank-2 type ensures request data cannot escape
+type Application = forall r. Request r -> (Response r -> IO ResponseSent) -> IO ResponseSent
 
 -- | Proof that response was sent (for type safety)
 data ResponseSent = ResponseSent
 
 -- | High-performance request representation
-data Request = Request
+-- All ByteString fields are arena-allocated and tagged with region 'r'
+data Request r = Request
   { -- Core request line
-    requestMethod      :: {-# UNPACK #-} !Method           -- Interned method
-  , requestPath        :: {-# UNPACK #-} !Path             -- Efficient path segments
-  , requestQueryString :: !QueryString                     -- Parsed query params
-  , requestHttpVersion :: {-# UNPACK #-} !HTTPVersion      -- Packed version
+    requestMethod      :: {-# UNPACK #-} !Method             -- Interned (global, no region)
+  , requestPath        :: !(Path r)                          -- Arena-allocated path
+  , requestQueryString :: !(QueryString r)                   -- Arena-allocated query
+  , requestHttpVersion :: {-# UNPACK #-} !HTTPVersion        -- Packed version (no region)
 
     -- Headers with Hermes types
-  , requestHeaders     :: {-# UNPACK #-} !HeaderMap        -- Interned header names
+  , requestHeaders     :: !(HeaderMap r)                     -- Arena-allocated headers
 
     -- Body handling
-  , requestBody        :: !RequestBody                     -- Streaming body
-  , requestBodyLength  :: !RequestBodyLength               -- Known or chunked
+  , requestBody        :: !(RequestBody r)                   -- Arena-scoped streaming
+  , requestBodyLength  :: !RequestBodyLength                 -- Known or chunked
 
     -- Connection info
-  , requestRemoteHost  :: !SockAddr                        -- Client address
-  , requestIsSecure    :: !Bool                            -- TLS?
+  , requestRemoteHost  :: !SockAddr                          -- Copied (small, outlives request)
+  , requestIsSecure    :: !Bool                              -- TLS?
 
-    -- Raw access (for backends that need it)
-  , requestRaw         :: !RawRequest                      -- Backend-specific
+    -- Arena for additional allocations during handling
+  , requestArena       :: !(Arena r)                         -- Handler can allocate here
   }
 
--- | Efficient path representation using fusion
-data Path = Path
-  { pathSegments   :: {-# UNPACK #-} !(Vector Text)  -- Decoded segments
-  , pathRaw        :: {-# UNPACK #-} !ByteString     -- Raw for forwarding
-  , pathUnmatched  :: {-# UNPACK #-} !Int            -- Index of first unmatched
+-- | Efficient path representation using arena memory
+data Path r = Path
+  { pathSegments   :: {-# UNPACK #-} !(SmallArray (Scoped r Text))  -- Arena-allocated
+  , pathRaw        :: !(Scoped r ByteString)                        -- Raw for forwarding
+  , pathUnmatched  :: {-# UNPACK #-} !Int                           -- Index of first unmatched
   }
 
--- | Pre-parsed query string
-data QueryString = QueryString
-  { queryParams  :: {-# UNPACK #-} !(HashMap Text (NonEmpty Text))
-  , queryRaw     :: {-# UNPACK #-} !ByteString
+-- | Pre-parsed query string (arena-allocated)
+data QueryString r = QueryString
+  { queryParams  :: !(HashMap Text (NonEmpty (Scoped r Text)))  -- Keys interned, values in arena
+  , queryRaw     :: !(Scoped r ByteString)
   }
 
--- | Streaming request body
-data RequestBody
-  = KnownLengthBody {-# UNPACK #-} !Int64 !(IO ByteString)
-  | ChunkedBody !(IO ByteString)
+-- | Streaming request body with arena integration
+data RequestBody r
+  = KnownLengthBody {-# UNPACK #-} !Int64 !(IO (Scoped r ByteString))  -- Chunks go to arena
+  | ChunkedBody !(IO (Scoped r ByteString))
   | NoBody
 ```
 
-### 10.2 Response Types
+### 10.3 Response Types (Region-Scoped)
 
 ```haskell
--- | High-performance response
-data Response = Response
-  { responseStatus  :: {-# UNPACK #-} !StatusCode
-  , responseHeaders :: {-# UNPACK #-} !HeaderMap      -- Type-safe headers!
-  , responseBody    :: !ResponseBody
+-- | High-performance response, region-tagged
+-- Response data uses the same arena as the request
+data Response r = Response
+  { responseStatus  :: {-# UNPACK #-} !StatusCode       -- No region (small)
+  , responseHeaders :: !(HeaderMap r)                   -- Arena-allocated headers
+  , responseBody    :: !(ResponseBody r)                -- Arena-scoped body
   }
 
--- | Response body variants
-data ResponseBody
-  = BuilderBody !Builder                              -- Efficient builder
-  | StreamingBody !StreamingBody                      -- Streaming chunks
-  | FileBody !FilePath !(Maybe FilePart)              -- Sendfile optimization
+-- | Response body variants - arena-aware
+data ResponseBody r
+  = BuilderBody !Builder                                -- Builder (will be serialized out)
+  | StreamingBody !(StreamingBody r)                    -- Streaming chunks from arena
+  | FileBody !FilePath !(Maybe FilePart)                -- Sendfile (no arena, kernel handles)
   | RawBody !(IO ByteString -> (ByteString -> IO ()) -> IO ())  -- Raw takeover
 
--- | Streaming body type
-type StreamingBody = (Builder -> IO ()) -> IO () -> IO ()
+-- | Streaming body type - chunks are arena-scoped
+type StreamingBody r = (Builder -> IO ()) -> IO () -> IO ()
 
 -- | Smart constructors with type-safe headers
-responseBuilder :: StatusCode -> HeaderMap -> Builder -> Response
+responseBuilder :: StatusCode -> HeaderMap r -> Builder -> Response r
 responseBuilder status hdrs body = Response status hdrs (BuilderBody body)
 
-responseStream :: StatusCode -> HeaderMap -> StreamingBody -> Response
+responseStream :: StatusCode -> HeaderMap r -> StreamingBody r -> Response r
 responseStream status hdrs body = Response status hdrs (StreamingBody body)
 
-responseFile :: StatusCode -> HeaderMap -> FilePath -> Maybe FilePart -> Response
+responseFile :: StatusCode -> HeaderMap r -> FilePath -> Maybe FilePart -> Response r
 responseFile status hdrs path part = Response status hdrs (FileBody path part)
 
 -- | Type-safe header setting
-setResponseHeader :: forall h.
+setResponseHeader :: forall h r.
   ( KnownHeader h
-  , Direction h `AllowedIn` 'Response
-  ) => h -> Response -> Response
+  , Direction h `AllowedIn` 'ResponseDir
+  ) => h -> Response r -> Response r
 setResponseHeader h resp = resp { responseHeaders = setHeader h (responseHeaders resp) }
+
+-- | Serialize response for transmission (copies out of arena)
+-- This is called at the very end of request handling
+serializeResponse :: Response r -> IO RawResponse
+serializeResponse resp = do
+  -- Headers are small, copy them
+  hdrs <- escapeHeaderMap (responseHeaders resp)
+  body <- case responseBody resp of
+    BuilderBody b -> pure $ RawBuilderBody b
+    StreamingBody s -> pure $ RawStreamingBody s
+    FileBody path part -> pure $ RawFileBody path part
+    RawBody r -> pure $ RawTakeover r
+  pure $ RawResponse (responseStatus resp) hdrs body
 ```
 
-### 10.3 Type-Safe Header Operations
+### 10.4 Type-Safe Header Operations
 
 ```haskell
 -- | Get a request header with compile-time direction check
-getRequestHeader :: forall h.
+getRequestHeader :: forall h r.
   ( KnownHeader h
-  , Direction h `AllowedIn` 'Request
-  ) => Request -> Either (ParseFailure h) (Maybe h)
+  , Direction h `AllowedIn` 'RequestDir
+  ) => Request r -> Either (ParseFailure h) (Maybe h)
 getRequestHeader req = lookupHeader @h (requestHeaders req)
 
 -- | Set a response header with compile-time direction check
-addResponseHeader :: forall h.
+addResponseHeader :: forall h r.
   ( KnownHeader h
-  , Direction h `AllowedIn` 'Response
-  ) => h -> HeaderMap -> HeaderMap
+  , Direction h `AllowedIn` 'ResponseDir
+  ) => h -> HeaderMap r -> HeaderMap r
 addResponseHeader = setHeader
 
 -- | Compile-time error for wrong direction
 -- This won't compile:
--- badExample :: Request -> Maybe SetCookie  -- SetCookie is Response-only!
+-- badExample :: Request r -> Maybe SetCookie  -- SetCookie is Response-only!
 -- badExample req = getRequestHeader @SetCookie req
--- Error: Header direction mismatch: SetCookie is Response, not Request
+-- Error: Header direction mismatch: SetCookie is ResponseDir, not RequestDir
 
 -- | Header presence witness
 data HeaderPresent h = HeaderPresent
@@ -1269,13 +1372,18 @@ data HeaderPresent h = HeaderPresent
   }
 
 -- | Require a header (fails request if missing)
-requireHeader :: forall h.
+requireHeader :: forall h r.
   ( KnownHeader h
-  , Direction h `AllowedIn` 'Request
-  ) => Request -> Either HeaderError (HeaderPresent h)
+  , Direction h `AllowedIn` 'RequestDir
+  ) => Request r -> Either HeaderError (HeaderPresent h)
 ```
 
-### 10.4 Backend Adapters
+### 10.5 Backend Adapters with Arena Integration
+
+Backends are responsible for:
+1. Allocating the per-request arena
+2. Parsing raw data into arena-scoped Request
+3. Serializing Response out of arena before freeing
 
 ```haskell
 -- | Type class for backend implementations
@@ -1283,16 +1391,17 @@ class Backend backend where
   type BackendConfig backend :: Type
   type BackendError backend :: Type
 
-  -- | Run an application with this backend
+  -- | Run an application with this backend and arena pool
   runBackend :: BackendConfig backend
-             -> Application
+             -> WorkerPool           -- ^ Arena pool for request handling
+             -> Application          -- ^ Rank-2 typed application
              -> IO (Either (BackendError backend) ())
 
-  -- | Convert backend-specific request to HAI Request
-  toHAIRequest :: backend -> RawRequest -> IO Request
+  -- | Parse raw request into arena-scoped Request
+  parseRequest :: backend -> Arena r -> RawRequest -> IO (Request r)
 
-  -- | Convert HAI Response to backend-specific response
-  fromHAIResponse :: backend -> Response -> IO RawResponse
+  -- | Serialize response before arena is freed
+  serializeResponse :: backend -> Response r -> IO RawResponse
 
 -- | WAI Backend Adapter
 data WAIBackend = WAIBackend
@@ -1301,35 +1410,51 @@ instance Backend WAIBackend where
   type BackendConfig WAIBackend = Warp.Settings
   type BackendError WAIBackend = SomeException
 
-  runBackend settings app =
-    try $ Warp.runSettings settings (toWaiApp app)
+  runBackend settings pool app =
+    try $ Warp.runSettings settings (toWaiApp pool app)
 
-  toHAIRequest _ waiReq = do
-    let headers = headerMapFromList (Wai.requestHeaders waiReq)
+  parseRequest _ arena waiReq = do
+    -- Parse headers into arena
+    headers <- arenaHeaderMap arena (Wai.requestHeaders waiReq)
+    -- Parse path into arena
+    path <- arenaPath arena (Wai.pathInfo waiReq) (Wai.rawPathInfo waiReq)
+    -- Parse query into arena
+    query <- arenaQuery arena (Wai.queryString waiReq) (Wai.rawQueryString waiReq)
+
     pure Request
       { requestMethod = Method $ intern $ Wai.requestMethod waiReq
-      , requestPath = pathFromWai waiReq
+      , requestPath = path
+      , requestQueryString = query
       , requestHeaders = headers
+      , requestArena = arena
       , ...
       }
 
--- | Convert HAI app to WAI app
-toWaiApp :: Application -> Wai.Application
-toWaiApp haiApp waiReq waiRespond = do
-  haiReq <- toHAIRequest WAIBackend waiReq
-  haiApp haiReq $ \haiResp -> do
-    waiResp <- fromHAIResponse WAIBackend haiResp
-    waiRespond waiResp
-    pure ResponseSent
+-- | Convert HAI app to WAI app with arena management
+toWaiApp :: WorkerPool -> Application -> Wai.Application
+toWaiApp pool haiApp waiReq waiRespond = do
+  -- Dispatch to pinned worker with arena
+  dispatchRequest pool $ \arena -> do
+    haiReq <- parseRequest WAIBackend arena waiReq
+    haiApp haiReq $ \haiResp -> do
+      -- Serialize before arena is freed
+      waiResp <- serializeResponse WAIBackend haiResp
+      waiRespond waiResp
+      pure ResponseSent
 
--- | Raw Socket Backend (from existing SimpleServer)
+-- | Raw Socket Backend with arena (from existing SimpleServer)
 data SocketBackend = SocketBackend
 
 instance Backend SocketBackend where
   type BackendConfig SocketBackend = ServerSettings
   type BackendError SocketBackend = IOException
 
-  runBackend settings app = runSocketServer settings app
+  runBackend settings pool app = runSocketServer settings pool app
+
+  -- Socket backend can do zero-copy parsing directly into arena
+  parseRequest _ arena rawBytes = do
+    -- flatparse directly into arena memory
+    parseHTTPRequestToArena arena rawBytes
 
 -- | HTTP/2 Backend (future)
 data HTTP2Backend = HTTP2Backend
@@ -1337,18 +1462,18 @@ data HTTP2Backend = HTTP2Backend
 instance Backend HTTP2Backend where
   type BackendConfig HTTP2Backend = HTTP2Settings
   type BackendError HTTP2Backend = HTTP2Error
-  -- ...
+  -- HTTP/2 frames map naturally to arena chunks
 
 -- | QUIC/HTTP3 Backend (future)
 data QUICBackend = QUICBackend
 ```
 
-### 10.5 Performance Optimizations & Allocation Reduction
+### 10.6 Performance Optimizations & Allocation Reduction
 
 Hermes prioritizes low-allocation, cache-friendly designs. This section details
 strategies for minimizing GC pressure and maximizing throughput.
 
-#### 10.5.1 Off-Heap and Compact Regions
+#### 10.6.1 Off-Heap and Compact Regions
 
 ```haskell
 {-# LANGUAGE MagicHash #-}
@@ -1400,7 +1525,7 @@ renderHeadersToPinned headers pba = do
       ...
 ```
 
-#### 10.5.2 Buffer Pools and Recycling
+#### 10.6.2 Buffer Pools and Recycling
 
 ```haskell
 -- | Pool of reusable buffers to avoid allocation per-request
@@ -1448,7 +1573,7 @@ getThreadLocalHeader tlb = do
       pure buf
 ```
 
-#### 10.5.3 Zero-Copy Path and Query Parsing
+#### 10.6.3 Zero-Copy Path and Query Parsing
 
 ```haskell
 -- | Path that references original request buffer (no copying)
@@ -1495,7 +1620,7 @@ matchSegment zcp i expected =
 {-# INLINE matchSegment #-}
 ```
 
-#### 10.5.4 Interning and Deduplication
+#### 10.6.4 Interning and Deduplication
 
 ```haskell
 -- | Hermes uses symbolize for O(1) header name comparison
@@ -1536,7 +1661,7 @@ statusLineBuilder (StatusCode code) =
 {-# INLINE statusLineBuilder #-}
 ```
 
-#### 10.5.5 Unboxed and Unpacked Data
+#### 10.6.5 Unboxed and Unpacked Data
 
 ```haskell
 {-# LANGUAGE UnboxedSums #-}
@@ -1568,7 +1693,7 @@ mkStatus# (W16# w) = w
 {-# INLINE mkStatus# #-}
 ```
 
-#### 10.5.6 Builder Fusion
+#### 10.6.6 Builder Fusion
 
 ```haskell
 -- | Fused header rendering (single pass, no intermediate structures)
@@ -1596,7 +1721,7 @@ statusOK = shortByteString "HTTP/1.1 200 OK\r\n"
 {-# INLINE statusOK #-}
 ```
 
-#### 10.5.7 Request Recycling
+#### 10.6.7 Request Recycling
 
 ```haskell
 -- | Mutable request structure for reuse across keep-alive connections
@@ -1841,55 +1966,89 @@ This approach:
                                    Response
 ```
 
-### 12.2 Resource Definition
+### 12.2 Resource Definition (Region-Scoped)
+
+Resources run in a region-scoped monad `ResourceT r m` which provides access
+to arena-allocated request data. The region parameter ensures handlers
+cannot hold onto request data past the request lifecycle.
 
 ```haskell
--- | A Resource defines behavior at each HTTP decision point
-data Resource m = Resource
-  { -- Service availability
-    resourceServiceAvailable    :: m Bool
+-- | Region-scoped resource handler monad
+-- Provides access to request data through the arena
+newtype ResourceT r m a = ResourceT
+  { unResourceT :: ReaderT (ResourceContext r) m a }
+  deriving (Functor, Applicative, Monad, MonadIO)
 
-    -- Method handling
-  , resourceKnownMethods        :: [Method]
-  , resourceAllowedMethods      :: m [Method]
-
-    -- Authentication & Authorization
-  , resourceIsAuthorized        :: m AuthResult
-  , resourceForbidden           :: m Bool
-
-    -- Content negotiation
-  , resourceContentTypesProvided :: m [(MediaType, m ResponseBody)]
-  , resourceContentTypesAccepted :: m [(MediaType, m ProcessResult)]
-  , resourceLanguagesProvided    :: m (Maybe [LanguageTag])
-  , resourceCharsetsProvided     :: m (Maybe [Charset])
-  , resourceEncodingsProvided    :: m (Maybe [ContentCoding])
-
-    -- Resource existence & lifecycle
-  , resourceExists              :: m Bool
-  , resourcePreviouslyExisted   :: m Bool
-  , resourceMovedPermanently    :: m (Maybe URI)
-  , resourceMovedTemporarily    :: m (Maybe URI)
-  , resourceAllowMissingPost    :: m Bool
-  , resourceDeleteResource      :: m Bool
-  , resourceDeleteCompleted     :: m Bool
-  , resourcePostIsCreate        :: m Bool
-  , resourceCreatePath          :: m (Maybe Text)
-
-    -- Conditional requests (ETags, Last-Modified)
-  , resourceGenerateETag        :: m (Maybe ETag)
-  , resourceLastModified        :: m (Maybe UTCTime)
-  , resourceExpires             :: m (Maybe UTCTime)
-
-    -- Caching
-  , resourceOptions             :: m [Header]
-  , resourceVariances           :: m [HeaderFieldName]
-
-    -- Multiple representations
-  , resourceMultipleChoices     :: m Bool
+-- | Context available during resource handling
+data ResourceContext r = ResourceContext
+  { resRequest :: !(Request r)     -- ^ Arena-scoped request
+  , resArena   :: !(Arena r)       -- ^ Arena for temp allocations
   }
 
+-- | A Resource defines behavior at each HTTP decision point
+-- The 'r' parameter tags all request data to the current region
+data Resource r m = Resource
+  { -- Service availability
+    resourceServiceAvailable    :: ResourceT r m Bool
+
+    -- Method handling
+  , resourceKnownMethods        :: [Method]  -- Static, no region needed
+  , resourceAllowedMethods      :: ResourceT r m [Method]
+
+    -- Authentication & Authorization
+  , resourceIsAuthorized        :: ResourceT r m AuthResult
+  , resourceForbidden           :: ResourceT r m Bool
+
+    -- Content negotiation
+    -- Note: ResponseBody can use arena for building, but is serialized out
+  , resourceContentTypesProvided :: ResourceT r m [(MediaType, ResourceT r m (ResponseBody r))]
+  , resourceContentTypesAccepted :: ResourceT r m [(MediaType, ResourceT r m ProcessResult)]
+  , resourceLanguagesProvided    :: ResourceT r m (Maybe [LanguageTag])
+  , resourceCharsetsProvided     :: ResourceT r m (Maybe [Charset])
+  , resourceEncodingsProvided    :: ResourceT r m (Maybe [ContentCoding])
+
+    -- Resource existence & lifecycle
+  , resourceExists              :: ResourceT r m Bool
+  , resourcePreviouslyExisted   :: ResourceT r m Bool
+  , resourceMovedPermanently    :: ResourceT r m (Maybe URI)  -- URI is copied
+  , resourceMovedTemporarily    :: ResourceT r m (Maybe URI)
+  , resourceAllowMissingPost    :: ResourceT r m Bool
+  , resourceDeleteResource      :: ResourceT r m Bool
+  , resourceDeleteCompleted     :: ResourceT r m Bool
+  , resourcePostIsCreate        :: ResourceT r m Bool
+  , resourceCreatePath          :: ResourceT r m (Maybe Text)  -- Copied for persistence
+
+    -- Conditional requests (ETags, Last-Modified)
+  , resourceGenerateETag        :: ResourceT r m (Maybe ETag)
+  , resourceLastModified        :: ResourceT r m (Maybe UTCTime)
+  , resourceExpires             :: ResourceT r m (Maybe UTCTime)
+
+    -- Caching
+  , resourceOptions             :: ResourceT r m [Header]
+  , resourceVariances           :: ResourceT r m [HeaderFieldName]
+
+    -- Multiple representations
+  , resourceMultipleChoices     :: ResourceT r m Bool
+  }
+
+-- | Access request data within a resource handler
+getRequestPath :: ResourceT r m (Scoped r ByteString)
+getRequestPath = ResourceT $ asks (pathRaw . requestPath . resRequest)
+
+getRequestBody :: ResourceT r m (RequestBody r)
+getRequestBody = ResourceT $ asks (requestBody . resRequest)
+
+-- | Allocate temporary data in the arena
+allocInArena :: (Arena r -> IO a) -> ResourceT r m a
+allocInArena f = ResourceT $ asks resArena >>= liftIO . f
+
+-- | When data needs to persist (e.g., for database storage), copy it
+-- This is the only safe way to escape region-scoped data
+persistData :: Copyable a => Scoped r a -> ResourceT r m a
+persistData = escape
+
 -- | Default resource with sensible defaults
-defaultResource :: Applicative m => Resource m
+defaultResource :: Applicative m => Resource r m
 defaultResource = Resource
   { resourceServiceAvailable     = pure True
   , resourceKnownMethods         = [mGet, mHead, mPost, mPut, mDelete, mPatch, mOptions]
@@ -1921,10 +2080,17 @@ defaultResource = Resource
 
 ### 12.3 Running the Decision Tree
 
+The decision tree runs within the request's region scope, ensuring proper
+memory management throughout the HTTP lifecycle.
+
 ```haskell
 -- | Execute the HTTP decision tree for a resource
-runResource :: Monad m => Resource m -> Request -> m Response
-runResource resource req = runDecisionTree decisions
+-- The rank-2 type ensures the entire decision tree stays within the region
+runResource :: forall m a. Monad m
+            => (forall r. Resource r m)
+            -> (forall r. Request r -> ResourceT r m (Response r))
+runResource resource req = runResourceT (ResourceContext req (requestArena req)) $
+  runDecisionTree decisions
   where
     decisions = DecisionTree
       { dtServiceAvailable = do
@@ -1932,6 +2098,7 @@ runResource resource req = runDecisionTree decisions
           if available then Right <$> continue else pure $ Left status503
 
       , dtKnownMethod = do
+          -- Method is interned (not arena-allocated), safe to access directly
           let method = requestMethod req
           if method `elem` resourceKnownMethods resource
             then Right <$> continue
@@ -1960,10 +2127,10 @@ runResource resource req = runDecisionTree decisions
       }
 
 -- | Type-safe decision result
-data DecisionResult
-  = Continue                         -- ^ Proceed to next decision
-  | Respond !StatusCode ![Header]    -- ^ Short-circuit with response
-  | Delegate !(m Response)           -- ^ Hand off to resource handler
+data DecisionResult r
+  = Continue                              -- ^ Proceed to next decision
+  | Respond !StatusCode ![Header]         -- ^ Short-circuit with response
+  | Delegate !(ResourceT r m (Response r)) -- ^ Hand off to resource handler
 ```
 
 ### 12.4 Lifecycle Hooks
@@ -3206,6 +3373,441 @@ userResourceWebmachine userId = defaultResource
 
 ---
 
+## Part 18: Advanced Memory Patterns
+
+This part covers advanced memory management patterns that build on the core
+arena infrastructure defined in Part 10. These patterns address specific
+performance scenarios like NUMA awareness, OS thread affinity, and linear
+types for additional compile-time guarantees.
+
+**Prerequisites**: Part 10.1 (Core Arena Infrastructure) defines the basic
+`Arena`, `Scoped`, `Copyable`, and `escape` abstractions that are used here.
+
+### 18.1 Linear Types for Stricter Guarantees
+
+While rank-2 types (ST-style regions) prevent data from escaping at runtime,
+linear types (GHC 9.0+) can provide even stronger compile-time guarantees
+by ensuring every piece of request data is explicitly consumed or copied:
+
+```haskell
+{-# LANGUAGE LinearTypes #-}
+{-# LANGUAGE QualifiedDo #-}
+{-# LANGUAGE GADTs #-}
+
+import qualified Data.Unrestricted.Linear as Linear
+
+-- | Linear request monad - request data must be consumed or copied
+-- Unlike plain RouteT, this enforces that all Scoped data is handled
+newtype RouteL r e m a where
+  RouteL :: (Request r %1 -> m (Request r, RouteResult e a)) %1 -> RouteL r e m a
+
+-- | Linear field access - must use the result
+getPathL :: Request r %1 -> (Scoped r ByteString, Request r)
+getPathL req = (pathRaw (requestPath req), req)
+
+-- | To persist data, you MUST copy - returns Ur (unrestricted)
+persistL :: Copyable a => Scoped r a %1 -> RouteL r e IO (Ur a)
+persistL scoped = RouteL $ \req -> do
+  copied <- deepCopy (unscoped scoped)
+  pure (req, Matched (Ur copied))
+
+-- | Ur wrapper for values that have left the linear world
+data Ur a where
+  Ur :: a -> Ur a
+
+-- | Example: Linear request handling
+handleLinear :: RouteL r ServerError IO (Response r)
+handleLinear = Linear.do
+  req <- getRequest
+  (path, req') <- pure $ getPathL req
+
+  -- TYPE ERROR if we try to ignore path:
+  -- pure $ ok "done"  -- Error: 'path' not consumed
+
+  -- Must either use it in response or copy it:
+  Ur pathCopy <- persistL path
+  liftIO $ Database.store pathCopy
+
+  -- Now we can return
+  finalizeRequest req'
+  pure $ ok "done"
+```
+
+### 18.2 OS Thread Affinity and Worker Pools
+
+GHC's green threads multiplex onto OS threads, making true TLS impossible.
+However, we can design around this:
+
+```haskell
+-- | Capability-pinned worker with dedicated arena
+data PinnedWorker = PinnedWorker
+  { workerCapability :: !Int          -- GHC capability (OS thread)
+  , workerArena      :: !(Ptr Word8)  -- Pre-allocated arena
+  , workerArenaSize  :: !Int
+  , workerArenaRef   :: !(IORef Int)  -- Current offset
+  , workerId         :: !Int
+  }
+
+-- | Worker pool with OS thread affinity
+data WorkerPool = WorkerPool
+  { poolWorkers :: !(Vector PinnedWorker)
+  , poolSize    :: !Int
+  }
+
+-- | Create a worker pool with one worker per capability
+createWorkerPool :: Int      -- ^ Arena size per worker
+                 -> IO WorkerPool
+createWorkerPool arenaSize = do
+  numCaps <- getNumCapabilities
+  workers <- V.generateM numCaps $ \cap -> do
+    arena <- mallocBytes arenaSize
+    ref <- newIORef 0
+    pure $ PinnedWorker cap arena arenaSize ref cap
+  pure $ WorkerPool workers numCaps
+
+-- | Run an action pinned to a specific OS thread's arena
+-- Uses forkOn to ensure capability affinity
+withPinnedArena :: WorkerPool
+                -> Int  -- ^ Worker index
+                -> (forall r. RequestT r IO a)
+                -> IO a
+withPinnedArena pool idx action = do
+  let worker = poolWorkers pool V.! (idx `mod` poolSize pool)
+
+  -- Reset arena for this request
+  writeIORef (workerArenaRef worker) 0
+
+  -- Run pinned to specific capability
+  resultVar <- newEmptyMVar
+  _ <- forkOn (workerCapability worker) $ do
+    let arena = RequestArena
+          (workerArena worker)
+          (workerArenaSize worker)
+          (workerArenaRef worker)
+    result <- runReaderT (unRequestT action) arena
+    putMVar resultVar result
+
+  takeMVar resultVar
+
+-- | Round-robin request distribution
+data RequestDispatcher = RequestDispatcher
+  { dispatcherPool    :: !WorkerPool
+  , dispatcherCounter :: !(IORef Int)
+  }
+
+dispatchRequest :: RequestDispatcher
+                -> (forall r. RequestT r IO Response)
+                -> IO Response
+dispatchRequest dispatcher action = do
+  idx <- atomicModifyIORef' (dispatcherCounter dispatcher) $ \n ->
+    (n + 1, n)
+  withPinnedArena (dispatcherPool dispatcher) idx action
+```
+
+### 18.3 Bound Threads for True TLS
+
+When you truly need thread-local storage (e.g., for C libraries):
+
+```haskell
+-- | Worker with bound OS thread (forkOS)
+data BoundWorker = BoundWorker
+  { boundThread    :: !ThreadId
+  , boundArena     :: !(Ptr Word8)
+  , boundArenaSize :: !Int
+  , boundWorkQueue :: !(TBQueue WorkItem)
+  , boundTLS       :: !(Ptr TLSData)  -- True thread-local storage
+  }
+
+data WorkItem = WorkItem
+  { workAction :: IO ()
+  , workResult :: MVar (Either SomeException ())
+  }
+
+-- | Thread-local storage structure (C-compatible)
+data TLSData = TLSData
+  { tlsArenaPtr    :: !(Ptr Word8)
+  , tlsArenaOffset :: !Int
+  , tlsConnectionPool :: !(Ptr ())  -- Connection pool for this thread
+  , tlsRNG         :: !(Ptr ())     -- Thread-local RNG state
+  }
+
+-- | Create a bound worker with true OS thread
+createBoundWorker :: Int -> IO BoundWorker
+createBoundWorker arenaSize = do
+  arena <- mallocBytes arenaSize
+  queue <- newTBQueueIO 1024
+  tlsPtr <- mallocBytes (sizeOf (undefined :: TLSData))
+  poke tlsPtr $ TLSData arena 0 nullPtr nullPtr
+
+  -- forkOS creates an actual OS thread
+  tid <- forkOS $ forever $ do
+    WorkItem action resultVar <- atomically $ readTBQueue queue
+    result <- try action
+    putMVar resultVar result
+
+  pure $ BoundWorker tid arena arenaSize queue tlsPtr
+
+-- | Submit work to bound thread
+submitToBoundWorker :: BoundWorker -> IO a -> IO a
+submitToBoundWorker worker action = do
+  resultVar <- newEmptyMVar
+  atomically $ writeTBQueue (boundWorkQueue worker) $
+    WorkItem (action >>= putMVar resultVar) resultVar
+  result <- takeMVar resultVar
+  either throwIO pure =<< takeMVar resultVar
+```
+
+### 18.4 NUMA-Aware Arena Allocation
+
+For multi-socket servers, NUMA awareness can significantly improve performance:
+
+```haskell
+-- | NUMA node identifier
+newtype NumaNode = NumaNode Int
+  deriving (Eq, Ord, Show)
+
+-- | NUMA-aware arena
+data NumaArena = NumaArena
+  { numaNode      :: !NumaNode
+  , numaArenaPtr  :: !(Ptr Word8)
+  , numaArenaSize :: !Int
+  , numaOffset    :: !(IORef Int)
+  }
+
+-- | Allocate memory on specific NUMA node
+-- Uses libnuma via FFI
+foreign import ccall unsafe "numa_alloc_onnode"
+  numa_alloc_onnode :: CSize -> CInt -> IO (Ptr a)
+
+foreign import ccall unsafe "numa_free"
+  numa_free :: Ptr a -> CSize -> IO ()
+
+-- | Create arena on specific NUMA node
+createNumaArena :: NumaNode -> Int -> IO NumaArena
+createNumaArena node@(NumaNode n) size = do
+  ptr <- numa_alloc_onnode (fromIntegral size) (fromIntegral n)
+  when (ptr == nullPtr) $ throwIO $ userError "NUMA allocation failed"
+  ref <- newIORef 0
+  pure $ NumaArena node ptr size ref
+
+-- | NUMA-aware worker pool
+data NumaWorkerPool = NumaWorkerPool
+  { numaWorkers :: !(Vector (Vector PinnedWorker))  -- Per-node workers
+  , numaMapping :: !(IntMap NumaNode)               -- Capability -> NUMA node
+  }
+
+-- | Create NUMA-aware pool
+-- Queries NUMA topology and pins workers appropriately
+createNumaWorkerPool :: Int -> IO NumaWorkerPool
+createNumaWorkerPool arenaSize = do
+  numNodes <- getNumNumaNodes
+  numCaps <- getNumCapabilities
+
+  -- Get NUMA node for each capability
+  numaMap <- IM.fromList <$> forM [0..numCaps-1] (\cap -> do
+    node <- getNumaNodeForCapability cap
+    pure (cap, NumaNode node))
+
+  -- Create workers grouped by NUMA node
+  workers <- V.generateM numNodes $ \node -> do
+    let capsOnNode = [c | (c, NumaNode n) <- IM.toList numaMap, n == node]
+    V.fromList <$> forM capsOnNode (\cap -> do
+      arena <- numa_alloc_onnode (fromIntegral arenaSize) (fromIntegral node)
+      ref <- newIORef 0
+      pure $ PinnedWorker cap arena arenaSize ref cap)
+
+  pure $ NumaWorkerPool workers numaMap
+
+-- | Foreign imports for NUMA queries
+foreign import ccall unsafe "numa_num_configured_nodes"
+  getNumNumaNodes :: IO Int
+
+foreign import ccall unsafe "numa_node_of_cpu"
+  numa_node_of_cpu :: CInt -> IO CInt
+
+getNumaNodeForCapability :: Int -> IO Int
+getNumaNodeForCapability cap = fromIntegral <$> numa_node_of_cpu (fromIntegral cap)
+```
+
+### 18.5 Arena Pooling with HAI Backends
+
+See Part 10.5 (Backend Adapters with Arena Integration) for the primary
+integration of arenas with HAI backends. This section covers additional
+pooling strategies for advanced scenarios.
+
+```haskell
+-- | Extended pool configuration for NUMA + bound thread hybrid
+data HybridPool = HybridPool
+  { hpNumaPool   :: !NumaWorkerPool      -- Per-NUMA-node pinned arenas
+  , hpBoundPool  :: !(Vector BoundWorker) -- Bound threads for TLS-needing code
+  , hpDispatcher :: !(IORef Int)          -- Round-robin counter
+  }
+
+-- | Dispatch with NUMA preference but fallback to bound thread
+-- Use case: Most requests use fast NUMA-local arenas, but some need
+-- true TLS for C library calls (e.g., OpenSSL, database drivers)
+dispatchHybrid :: HybridPool
+               -> Bool  -- ^ Does this request need TLS?
+               -> (forall r. RouteT r e IO a)
+               -> IO a
+dispatchHybrid pool needsTLS action = do
+  idx <- atomicModifyIORef' (hpDispatcher pool) $ \n -> (n + 1, n)
+
+  if needsTLS
+    then do
+      -- Route to bound thread for TLS support
+      let worker = hpBoundPool pool V.! (idx `mod` V.length (hpBoundPool pool))
+      submitToBoundWorker worker $ withLocalArena action
+    else do
+      -- Route to NUMA-local pinned worker
+      cap <- getCurrentCapability
+      let node = numaMapping (hpNumaPool pool) IM.! cap
+          workers = numaWorkers (hpNumaPool pool) V.! fromIntegral node
+          worker = workers V.! (idx `mod` V.length workers)
+      withPinnedArena' worker action
+
+-- | Query which requests need TLS (configured per-route)
+newtype NeedsTLS = NeedsTLS Bool
+
+class HasTLSRequirement a where
+  needsTLS :: a -> Bool
+
+instance HasTLSRequirement Resource where
+  needsTLS r = resourceNeedsTLS r  -- New field on Resource
+```
+
+### 18.6 Chunked Arena for Large Requests
+
+For requests that exceed initial arena size:
+
+```haskell
+-- | Chunked arena that can grow
+data ChunkedArena r = ChunkedArena
+  { caChunks   :: !(IORef [ArenaChunk])
+  , caCurrentChunk :: !(IORef ArenaChunk)
+  , caChunkSize :: !Int
+  }
+
+data ArenaChunk = ArenaChunk
+  { chunkPtr    :: !(Ptr Word8)
+  , chunkSize   :: !Int
+  , chunkOffset :: !(IORef Int)
+  }
+
+-- | Allocate in chunked arena, growing if necessary
+chunkedAlloc :: ChunkedArena r -> Int -> IO (Ptr Word8)
+chunkedAlloc ca size = do
+  current <- readIORef (caCurrentChunk ca)
+  offset <- readIORef (chunkOffset current)
+
+  if offset + size <= chunkSize current
+    then do
+      -- Fits in current chunk
+      writeIORef (chunkOffset current) (offset + size)
+      pure $ chunkPtr current `plusPtr` offset
+    else do
+      -- Need new chunk
+      let newSize = max (caChunkSize ca) size
+      newPtr <- mallocBytes newSize
+      newOffsetRef <- newIORef size
+      let newChunk = ArenaChunk newPtr newSize newOffsetRef
+
+      -- Add to chunk list (for cleanup)
+      modifyIORef' (caChunks ca) (current :)
+      writeIORef (caCurrentChunk ca) newChunk
+
+      pure newPtr
+
+-- | Free all chunks
+freeChunkedArena :: ChunkedArena r -> IO ()
+freeChunkedArena ca = do
+  chunks <- readIORef (caChunks ca)
+  current <- readIORef (caCurrentChunk ca)
+  mapM_ (free . chunkPtr) (current : chunks)
+```
+
+### 18.7 Zero-Copy Request Parsing with Arenas
+
+Combine arena allocation with zero-copy parsing:
+
+```haskell
+-- | Parse HTTP request with zero-copy into arena
+parseHTTPRequest :: ChunkedArena r
+                 -> ByteString  -- ^ Raw input (pinned memory from socket)
+                 -> IO (Request r)
+parseHTTPRequest arena input = do
+  -- Parser that records slices instead of copying
+  runFlatParse input $ do
+    method <- parseMethod  -- Small, copied
+    _ <- skipSpace
+
+    -- Path: record slice into original buffer
+    pathStart <- getOffset
+    pathEnd <- skipWhile (/= ' ')
+    pathLen <- subtract pathStart <$> getOffset
+
+    let pathSlice = PS (unsafeCoerce# input) pathStart pathLen
+
+    -- Store slice reference in arena
+    pathRef <- liftIO $ chunkedAlloc arena (sizeOf (undefined :: ByteString))
+    liftIO $ poke (castPtr pathRef) pathSlice
+
+    -- Headers: parse into arena-allocated vector
+    headers <- parseHeadersToArena arena
+
+    pure $ Request
+      { reqPath' = Scoped pathSlice
+      , reqMethod' = method
+      , reqHeaders' = Scoped headers
+      , reqBody' = undefined  -- Parsed lazily
+      }
+```
+
+### 18.8 Safety Properties and Verification
+
+The arena system provides these safety guarantees:
+
+```haskell
+-- | Properties we can verify:
+
+-- 1. No escape without copy (rank-2 type ensures this)
+-- COMPILE ERROR:
+badHandler :: IO ByteString
+badHandler = withRequestArena 4096 $ do
+  Scoped bs <- arenaByteString "hello"
+  pure bs  -- Error: 'r' would escape its scope
+
+-- CORRECT:
+goodHandler :: IO ByteString
+goodHandler = withRequestArena 4096 $ do
+  Scoped bs <- arenaByteString "hello"
+  escape (Scoped bs)  -- Explicit copy
+
+-- 2. Linear types ensure consumption (with LinearTypes)
+-- COMPILE ERROR:
+badLinear :: RequestL r IO ()
+badLinear = Linear.do
+  (path, req) <- getPath <$> getRequest
+  pure ()  -- Error: 'path' is not consumed
+
+-- CORRECT:
+goodLinear :: RequestL r IO ()
+goodLinear = Linear.do
+  (path, req) <- getPath <$> getRequest
+  _ <- persistPath path  -- path is consumed
+  finalizeRequest req    -- req is consumed
+  pure ()
+
+-- 3. Inspection testing for arena optimizations
+{-# LANGUAGE TemplateHaskell #-}
+
+-- Verify that arena operations are inlined
+inspect $ 'handleRequest `hasNoType` ''IORef
+inspect $ 'handleRequest `hasNoAllocation` ''ByteString
+```
+
+---
+
 ## Appendix A: Comparison Matrix
 
 | Feature | Akka HTTP | Servant | Webmachine | Hermes (Proposed) |
@@ -3218,6 +3820,8 @@ userResourceWebmachine userId = defaultResource
 | OpenAPI/Swagger | Plugin | Built-in | N/A | Planned |
 | Performance | Excellent | Excellent | Excellent | Excellent (goal) |
 | Learning Curve | Moderate | Steep | Moderate | Moderate (goal) |
+| Memory Management | JVM GC | GHC GC | Erlang GC | Arena + Region types |
+| Request Data Scope | Manual | Manual | Process-scoped | Region-scoped |
 | HTTP Semantics | Manual | Manual | Built-in | Built-in (Resource) |
 | Conditional Requests | Manual | Manual | Built-in | Built-in |
 | Content Negotiation | Basic | Basic | Full | Full |
@@ -3263,6 +3867,10 @@ dependencies:
   - inspection-testing # Verify rewrite rules fire
   - primitive          # Low-level memory operations
   - compact            # Compact regions (GHC 8.2+)
+
+  # Arena & linear types (optional advanced features)
+  - linear-base        # Linear types support (GHC 9.0+)
+  - numa               # NUMA-aware allocation (optional)
 
   # OpenTelemetry
   - hs-opentelemetry-api          # OTel API
