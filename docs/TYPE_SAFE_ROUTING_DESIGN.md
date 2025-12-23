@@ -8,6 +8,8 @@ This document specifies the design for expanding Hermes into a full type-safe HT
 2. **Bidirectional derivation** - Generate both servers and clients from the same specification
 3. **Composable directives** - Build complex routes from simple, reusable building blocks
 4. **Integration with existing Hermes primitives** - Leverage the existing `KnownHeader`, `Method`, `StatusCode` infrastructure
+5. **Template Haskell support** - Compile-time route generation with better error messages and zero runtime overhead
+6. **Backend-agnostic design** - A new application interface ("HAI") that improves on WAI with more performant types, while supporting multiple backends
 
 ## Background: Akka HTTP vs Servant
 
@@ -558,9 +560,220 @@ createUser :: NewUser -> ClientM User
 
 ---
 
-## Part 8: Authentication & Authorization
+## Part 8: Template Haskell Support
 
-### 8.1 Authentication Directives
+Template Haskell provides compile-time metaprogramming for route generation, validation, and optimization. This is a key differentiator from both Servant (which relies purely on type-level programming with often inscrutable errors) and Akka HTTP (which has no compile-time route analysis).
+
+### 8.1 Route Quasi-Quoters
+
+```haskell
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
+
+-- | Quasi-quoter for defining routes with compile-time validation
+-- Syntax: METHOD /path/segments/:capture -> handlerName
+[routes|
+  GET    /users                     -> listUsers
+  GET    /users/:userId             -> getUser
+  POST   /users                     -> createUser
+  PUT    /users/:userId             -> updateUser
+  DELETE /users/:userId             -> deleteUser
+  GET    /users/:userId/posts       -> getUserPosts
+  GET    /users/:userId/posts/:postId -> getUserPost
+|]
+
+-- The above generates:
+-- 1. A routing function that pattern-matches efficiently
+-- 2. Type signatures that enforce handler types
+-- 3. Compile-time validation of route conflicts
+-- 4. Reverse routing functions for URL generation
+```
+
+### 8.2 Compile-Time Route Validation
+
+```haskell
+-- | TH function to validate routes at compile time
+validateRoutes :: Q [Dec] -> Q [Dec]
+validateRoutes routesQ = do
+  routes <- routesQ
+  -- Check for:
+  -- 1. Ambiguous routes (two routes that could match the same path)
+  -- 2. Unreachable routes (a more specific route after a general one)
+  -- 3. Type mismatches between captures and handlers
+  -- 4. Missing handlers
+  checkAmbiguousRoutes routes
+  checkUnreachableRoutes routes
+  checkHandlerTypes routes
+  pure routes
+
+-- Example: This would fail at compile time
+[routes|
+  GET /users/:id     -> getUser      -- captures 'id' as Text
+  GET /users/:userId -> getUserById  -- COMPILE ERROR: ambiguous with above
+|]
+
+-- Example: Unreachable route detection
+[routes|
+  GET /users/*       -> catchAll     -- catches everything
+  GET /users/:id     -> getUser      -- COMPILE ERROR: unreachable
+|]
+```
+
+### 8.3 Type-Safe Captures with TH
+
+```haskell
+-- | Generate capture parsers with custom types at compile time
+mkCapture :: String -> TypeQ -> Q [Dec]
+mkCapture name typ = [d|
+  $(varP (mkName name)) :: PathPiece $(typ) => RouteT e m $(typ)
+  $(varP (mkName name)) = capture @($(typ))
+  |]
+
+-- Usage:
+$(mkCapture "userId" [t|UserId|])
+$(mkCapture "postId" [t|PostId|])
+
+-- Or with the routes QQ, specify types inline:
+[routes|
+  GET /users/:userId<UserId>/posts/:postId<PostId> -> getUserPost
+|]
+-- Generates: getUserPost :: UserId -> PostId -> Handler Response
+```
+
+### 8.4 Compile-Time Route Optimization
+
+```haskell
+-- | Generate an optimized routing trie at compile time
+-- This eliminates runtime route parsing overhead
+mkRoutingTrie :: [RouteSpec] -> Q Exp
+mkRoutingTrie specs = do
+  let trie = buildTrie specs
+  -- Generate pattern matching code that mirrors the trie structure
+  -- This compiles to efficient nested case expressions
+  generateTrieMatching trie
+
+-- The generated code looks like:
+-- case segment1 of
+--   "users" -> case segment2 of
+--     [] -> usersHandler
+--     (seg:rest) -> case parsePathPiece seg of
+--       Just userId -> case rest of
+--         [] -> getUserHandler userId
+--         ["posts"] -> getUserPostsHandler userId
+--         ...
+--   "health" -> healthHandler
+--   _ -> notFoundHandler
+```
+
+### 8.5 Reverse Routing (URL Generation)
+
+```haskell
+-- | Type-safe URL generation from route definitions
+-- Generated automatically from route quasi-quoter
+
+-- For route: GET /users/:userId/posts/:postId -> getUserPost
+-- Generates:
+getUserPostUrl :: UserId -> PostId -> Text
+getUserPostUrl userId postId =
+  "/users/" <> renderPathPiece userId <> "/posts/" <> renderPathPiece postId
+
+-- With query parameters:
+-- GET /search?q=:query&limit=:limit -> searchHandler
+searchUrl :: Text -> Maybe Int -> Text
+searchUrl query mLimit =
+  "/search?q=" <> urlEncode query <> maybe "" (("&limit=" <>) . T.pack . show) mLimit
+
+-- Link generation for type-level APIs
+class HasLink api where
+  type MkLink api :: Type
+  toLink :: Proxy api -> MkLink api
+
+-- Usage:
+link :: Text
+link = toLink (Proxy @("users" :> Capture "id" Int :> Get '[JSON] User)) 42
+-- Result: "/users/42"
+```
+
+### 8.6 TH-Generated Handler Type Enforcement
+
+```haskell
+-- | Derive handler type signatures from route specifications
+mkHandlers :: QuasiQuoter
+mkHandlers = QuasiQuoter { quoteExp = parseHandlers }
+
+-- Usage:
+[mkHandlers|
+  listUsers   : GET  /users           -> [User]
+  getUser     : GET  /users/:Int      -> User
+  createUser  : POST /users           <- NewUser -> User
+  updateUser  : PUT  /users/:Int      <- UpdateUser -> User
+  deleteUser  : DELETE /users/:Int    -> NoContent
+|]
+
+-- Generates type signatures:
+-- listUsers  :: Handler [User]
+-- getUser    :: Int -> Handler User
+-- createUser :: NewUser -> Handler User
+-- updateUser :: Int -> UpdateUser -> Handler User
+-- deleteUser :: Int -> Handler NoContent
+
+-- And stub implementations that fail at runtime if not implemented:
+-- listUsers = notImplemented "listUsers"
+-- etc.
+```
+
+### 8.7 Route Documentation Generation
+
+```haskell
+-- | Generate documentation at compile time
+mkRouteDocs :: Q [Dec] -> Q Exp
+mkRouteDocs routesQ = do
+  routes <- analyzeRoutes routesQ
+  -- Generate a documentation data structure
+  [e| RouteDocumentation
+        { docRoutes = $(listE $ map routeToDoc routes)
+        , docVersion = $(stringE =<< runIO getPackageVersion)
+        , docGenerated = $(stringE =<< runIO getCurrentTime)
+        }
+    |]
+
+-- Can be used to generate:
+-- - OpenAPI/Swagger specs at compile time
+-- - Static documentation pages
+-- - Client SDK documentation
+```
+
+### 8.8 Error Message Improvement
+
+```haskell
+-- | Custom type errors with helpful messages
+type family ValidateRoute (route :: Type) :: Constraint where
+  ValidateRoute (Capture name a :> Capture name' a' :> rest) =
+    TypeError ('Text "Adjacent captures are ambiguous: /"
+               ':<>: 'Text name ':<>: 'Text "/:" ':<>: 'Text name'
+               ':$$: 'Text "Consider adding a static segment between them")
+  ValidateRoute (path :> rest) = ValidateRoute rest
+  ValidateRoute terminal = ()
+
+-- TH can provide even better errors:
+validateRoutesTH :: [RouteSpec] -> Q ()
+validateRoutesTH routes = do
+  forM_ (findConflicts routes) $ \(r1, r2) ->
+    reportError $ unlines
+      [ "Route conflict detected:"
+      , "  Route 1: " ++ showRoute r1
+      , "  Route 2: " ++ showRoute r2
+      , ""
+      , "These routes would match the same request."
+      , "Consider making one more specific or combining them."
+      ]
+```
+
+---
+
+## Part 9: Authentication & Authorization
+
+### 9.1 Authentication Directives
 
 ```haskell
 -- | Authentication result
@@ -608,7 +821,7 @@ optionalAuth scheme = do
     _                  -> Nothing
 ```
 
-### 8.2 Authorization
+### 9.2 Authorization
 
 ```haskell
 -- | Permission type class
@@ -632,9 +845,301 @@ withAuth scheme perm = do
 
 ---
 
-## Part 9: Middleware & Filters
+## Part 10: Hermes Application Interface (HAI) - Backend Abstraction
 
-### 9.1 Route Transformers
+WAI (Web Application Interface) has served the Haskell ecosystem well, but it has limitations:
+- Headers as `[(CI ByteString, ByteString)]` - inefficient, no type safety
+- Tightly coupled to specific representations
+- No compile-time header validation
+- Limited streaming primitives
+
+Hermes introduces **HAI** (Hermes Application Interface), a next-generation abstraction that:
+- Uses Hermes's efficient `HeaderMap` with interned `HeaderFieldName`
+- Supports multiple backends (WAI adapter, raw sockets, HTTP/2, QUIC)
+- Provides zero-copy operations where possible
+- Enables compile-time header direction checking
+
+### 10.1 Core Types
+
+```haskell
+-- | The Hermes Application type - backend agnostic
+type Application = Request -> (Response -> IO ResponseSent) -> IO ResponseSent
+
+-- | Proof that response was sent (for type safety)
+data ResponseSent = ResponseSent
+
+-- | High-performance request representation
+data Request = Request
+  { -- Core request line
+    requestMethod      :: {-# UNPACK #-} !Method           -- Interned method
+  , requestPath        :: {-# UNPACK #-} !Path             -- Efficient path segments
+  , requestQueryString :: !QueryString                     -- Parsed query params
+  , requestHttpVersion :: {-# UNPACK #-} !HTTPVersion      -- Packed version
+
+    -- Headers with Hermes types
+  , requestHeaders     :: {-# UNPACK #-} !HeaderMap        -- Interned header names
+
+    -- Body handling
+  , requestBody        :: !RequestBody                     -- Streaming body
+  , requestBodyLength  :: !RequestBodyLength               -- Known or chunked
+
+    -- Connection info
+  , requestRemoteHost  :: !SockAddr                        -- Client address
+  , requestIsSecure    :: !Bool                            -- TLS?
+
+    -- Raw access (for backends that need it)
+  , requestRaw         :: !RawRequest                      -- Backend-specific
+  }
+
+-- | Efficient path representation using fusion
+data Path = Path
+  { pathSegments   :: {-# UNPACK #-} !(Vector Text)  -- Decoded segments
+  , pathRaw        :: {-# UNPACK #-} !ByteString     -- Raw for forwarding
+  , pathUnmatched  :: {-# UNPACK #-} !Int            -- Index of first unmatched
+  }
+
+-- | Pre-parsed query string
+data QueryString = QueryString
+  { queryParams  :: {-# UNPACK #-} !(HashMap Text (NonEmpty Text))
+  , queryRaw     :: {-# UNPACK #-} !ByteString
+  }
+
+-- | Streaming request body
+data RequestBody
+  = KnownLengthBody {-# UNPACK #-} !Int64 !(IO ByteString)
+  | ChunkedBody !(IO ByteString)
+  | NoBody
+```
+
+### 10.2 Response Types
+
+```haskell
+-- | High-performance response
+data Response = Response
+  { responseStatus  :: {-# UNPACK #-} !StatusCode
+  , responseHeaders :: {-# UNPACK #-} !HeaderMap      -- Type-safe headers!
+  , responseBody    :: !ResponseBody
+  }
+
+-- | Response body variants
+data ResponseBody
+  = BuilderBody !Builder                              -- Efficient builder
+  | StreamingBody !StreamingBody                      -- Streaming chunks
+  | FileBody !FilePath !(Maybe FilePart)              -- Sendfile optimization
+  | RawBody !(IO ByteString -> (ByteString -> IO ()) -> IO ())  -- Raw takeover
+
+-- | Streaming body type
+type StreamingBody = (Builder -> IO ()) -> IO () -> IO ()
+
+-- | Smart constructors with type-safe headers
+responseBuilder :: StatusCode -> HeaderMap -> Builder -> Response
+responseBuilder status hdrs body = Response status hdrs (BuilderBody body)
+
+responseStream :: StatusCode -> HeaderMap -> StreamingBody -> Response
+responseStream status hdrs body = Response status hdrs (StreamingBody body)
+
+responseFile :: StatusCode -> HeaderMap -> FilePath -> Maybe FilePart -> Response
+responseFile status hdrs path part = Response status hdrs (FileBody path part)
+
+-- | Type-safe header setting
+setResponseHeader :: forall h.
+  ( KnownHeader h
+  , Direction h `AllowedIn` 'Response
+  ) => h -> Response -> Response
+setResponseHeader h resp = resp { responseHeaders = setHeader h (responseHeaders resp) }
+```
+
+### 10.3 Type-Safe Header Operations
+
+```haskell
+-- | Get a request header with compile-time direction check
+getRequestHeader :: forall h.
+  ( KnownHeader h
+  , Direction h `AllowedIn` 'Request
+  ) => Request -> Either (ParseFailure h) (Maybe h)
+getRequestHeader req = lookupHeader @h (requestHeaders req)
+
+-- | Set a response header with compile-time direction check
+addResponseHeader :: forall h.
+  ( KnownHeader h
+  , Direction h `AllowedIn` 'Response
+  ) => h -> HeaderMap -> HeaderMap
+addResponseHeader = setHeader
+
+-- | Compile-time error for wrong direction
+-- This won't compile:
+-- badExample :: Request -> Maybe SetCookie  -- SetCookie is Response-only!
+-- badExample req = getRequestHeader @SetCookie req
+-- Error: Header direction mismatch: SetCookie is Response, not Request
+
+-- | Header presence witness
+data HeaderPresent h = HeaderPresent
+  { getHeaderValue :: h
+  }
+
+-- | Require a header (fails request if missing)
+requireHeader :: forall h.
+  ( KnownHeader h
+  , Direction h `AllowedIn` 'Request
+  ) => Request -> Either HeaderError (HeaderPresent h)
+```
+
+### 10.4 Backend Adapters
+
+```haskell
+-- | Type class for backend implementations
+class Backend backend where
+  type BackendConfig backend :: Type
+  type BackendError backend :: Type
+
+  -- | Run an application with this backend
+  runBackend :: BackendConfig backend
+             -> Application
+             -> IO (Either (BackendError backend) ())
+
+  -- | Convert backend-specific request to HAI Request
+  toHAIRequest :: backend -> RawRequest -> IO Request
+
+  -- | Convert HAI Response to backend-specific response
+  fromHAIResponse :: backend -> Response -> IO RawResponse
+
+-- | WAI Backend Adapter
+data WAIBackend = WAIBackend
+
+instance Backend WAIBackend where
+  type BackendConfig WAIBackend = Warp.Settings
+  type BackendError WAIBackend = SomeException
+
+  runBackend settings app =
+    try $ Warp.runSettings settings (toWaiApp app)
+
+  toHAIRequest _ waiReq = do
+    let headers = headerMapFromList (Wai.requestHeaders waiReq)
+    pure Request
+      { requestMethod = Method $ intern $ Wai.requestMethod waiReq
+      , requestPath = pathFromWai waiReq
+      , requestHeaders = headers
+      , ...
+      }
+
+-- | Convert HAI app to WAI app
+toWaiApp :: Application -> Wai.Application
+toWaiApp haiApp waiReq waiRespond = do
+  haiReq <- toHAIRequest WAIBackend waiReq
+  haiApp haiReq $ \haiResp -> do
+    waiResp <- fromHAIResponse WAIBackend haiResp
+    waiRespond waiResp
+    pure ResponseSent
+
+-- | Raw Socket Backend (from existing SimpleServer)
+data SocketBackend = SocketBackend
+
+instance Backend SocketBackend where
+  type BackendConfig SocketBackend = ServerSettings
+  type BackendError SocketBackend = IOException
+
+  runBackend settings app = runSocketServer settings app
+
+-- | HTTP/2 Backend (future)
+data HTTP2Backend = HTTP2Backend
+
+instance Backend HTTP2Backend where
+  type BackendConfig HTTP2Backend = HTTP2Settings
+  type BackendError HTTP2Backend = HTTP2Error
+  -- ...
+
+-- | QUIC/HTTP3 Backend (future)
+data QUICBackend = QUICBackend
+```
+
+### 10.5 Performance Optimizations
+
+```haskell
+-- | Zero-copy header access
+-- Headers are stored with interned names, enabling O(1) comparison
+lookupHeaderFast :: HeaderFieldName -> HeaderMap -> Maybe (NonEmpty ByteString)
+lookupHeaderFast name (HeaderMap m) = Map.lookup name m  -- Symbol comparison is pointer equality
+
+-- | Pre-computed common headers for responses
+commonResponseHeaders :: HeaderMap
+commonResponseHeaders = headerMapFromList
+  [ (hServer, "Hermes")
+  , (hConnection, "keep-alive")
+  ]
+{-# NOINLINE commonResponseHeaders #-}
+
+-- | Efficient header map merging
+mergeHeaders :: HeaderMap -> HeaderMap -> HeaderMap
+mergeHeaders (HeaderMap a) (HeaderMap b) = HeaderMap (Map.unionWith (<>) a b)
+
+-- | Builder-based response construction (no intermediate ByteStrings)
+buildResponse :: Response -> Builder
+buildResponse Response{..} = mconcat
+  [ statusLineBuilder responseStatus
+  , headersBuilder responseHeaders
+  , crlfBuilder
+  , case responseBody of
+      BuilderBody b -> b
+      _ -> mempty  -- Streaming handled separately
+  ]
+
+-- | Memory-mapped file responses
+data FilePart = FilePart
+  { filePartOffset :: {-# UNPACK #-} !Int64
+  , filePartLength :: {-# UNPACK #-} !Int64
+  }
+
+-- | Sendfile support (when available)
+responseFileSendfile :: StatusCode -> HeaderMap -> FilePath -> Maybe FilePart -> Response
+```
+
+### 10.6 Streaming Primitives
+
+```haskell
+-- | Chunked encoding support
+chunkedStream :: StreamingBody -> ResponseBody
+chunkedStream body = StreamingBody $ \send flush -> do
+  body (send . chunkedEncode) flush
+  send "0\r\n\r\n"  -- Final chunk
+
+-- | Server-Sent Events helper
+sseStream :: (SSEEvent -> IO ()) -> IO () -> StreamingBody
+sseStream onEvent cleanup = \send flush -> do
+  onEvent $ \event -> do
+    send (sseEncode event)
+    flush
+  cleanup
+
+-- | WebSocket upgrade (raw response takeover)
+websocketUpgrade :: (WebSocket -> IO ()) -> Response
+websocketUpgrade handler = Response
+  { responseStatus = status101
+  , responseHeaders = websocketHeaders
+  , responseBody = RawBody $ \recv send -> do
+      ws <- initWebSocket recv send
+      handler ws
+  }
+```
+
+### 10.7 HAI vs WAI Comparison
+
+| Feature | WAI | HAI (Hermes) |
+|---------|-----|--------------|
+| Header representation | `[(CI ByteString, ByteString)]` | `HeaderMap` (interned names) |
+| Header lookup | O(n) linear scan | O(1) hash lookup |
+| Header name comparison | Case-insensitive ByteString | Pointer equality (interned) |
+| Type-safe headers | No | Yes (KnownHeader) |
+| Direction checking | No | Compile-time |
+| Path representation | `[Text]` | `Path` with raw + parsed |
+| Query string | Raw `ByteString` | Pre-parsed `HashMap` |
+| Method | `ByteString` | Interned `Symbol` |
+| Backend support | Warp only (effectively) | Multiple backends |
+
+---
+
+## Part 11: Middleware & Filters
+
+### 11.1 Route Transformers
 
 ```haskell
 -- | Transform a route (middleware)
@@ -674,7 +1179,7 @@ rateLimitMiddleware limiter route = RouteT $ \ctx -> do
 (f >>> g) route = f (g route)
 ```
 
-### 9.2 Exception Handling
+### 11.2 Exception Handling
 
 ```haskell
 -- | Catch exceptions and convert to route failures
@@ -697,33 +1202,475 @@ handleErrors handler route = RouteT $ \ctx -> do
 
 ---
 
-## Part 10: Running Routes
+## Part 12: Webmachine-Style HTTP Decision Tree
 
-### 10.1 WAI Integration
+Inspired by [Webmachine](https://github.com/webmachine/webmachine) (Erlang/OTP), Hermes provides semantic hooks into the HTTP request lifecycle. Instead of ad-hoc middleware, this models HTTP semantics as a decision tree where each decision point corresponds to a specific HTTP semantic.
+
+This approach:
+- Makes HTTP semantics explicit and correct by default
+- Provides clear extension points for customization
+- Ensures proper status codes and headers are returned
+- Simplifies reasoning about request handling
+
+### 12.1 The HTTP Decision Tree
+
+```
+                                    Request
+                                       │
+                                       ▼
+                              ┌─────────────────┐
+                              │ serviceAvailable │───No──▶ 503 Service Unavailable
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │  knownMethod    │───No──▶ 501 Not Implemented
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │   uriTooLong    │──Yes──▶ 414 URI Too Long
+                              └────────┬────────┘
+                                       │No
+                                       ▼
+                              ┌─────────────────┐
+                              │  methodAllowed  │───No──▶ 405 Method Not Allowed
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │   authorized    │───No──▶ 401 Unauthorized
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │   forbidden     │──Yes──▶ 403 Forbidden
+                              └────────┬────────┘
+                                       │No
+                                       ▼
+                              ┌─────────────────┐
+                              │  contentTypeOk  │───No──▶ 415 Unsupported Media Type
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │  acceptExists   │───────▶ Content Negotiation
+                              └────────┬────────┘
+                                       │
+                                       ▼
+                              ┌─────────────────┐
+                              │ resourceExists  │───No──▶ 404 / POST creates
+                              └────────┬────────┘
+                                       │Yes
+                                       ▼
+                              ┌─────────────────┐
+                              │  conditionals   │───────▶ 304/412 if applicable
+                              └────────┬────────┘
+                                       │
+                                       ▼
+                               Process Request
+                                       │
+                                       ▼
+                                   Response
+```
+
+### 12.2 Resource Definition
 
 ```haskell
--- | Convert a route to a WAI Application
-toApplication :: RouteT ServerError IO Response -> Application
-toApplication route request respond = do
+-- | A Resource defines behavior at each HTTP decision point
+data Resource m = Resource
+  { -- Service availability
+    resourceServiceAvailable    :: m Bool
+
+    -- Method handling
+  , resourceKnownMethods        :: [Method]
+  , resourceAllowedMethods      :: m [Method]
+
+    -- Authentication & Authorization
+  , resourceIsAuthorized        :: m AuthResult
+  , resourceForbidden           :: m Bool
+
+    -- Content negotiation
+  , resourceContentTypesProvided :: m [(MediaType, m ResponseBody)]
+  , resourceContentTypesAccepted :: m [(MediaType, m ProcessResult)]
+  , resourceLanguagesProvided    :: m (Maybe [LanguageTag])
+  , resourceCharsetsProvided     :: m (Maybe [Charset])
+  , resourceEncodingsProvided    :: m (Maybe [ContentCoding])
+
+    -- Resource existence & lifecycle
+  , resourceExists              :: m Bool
+  , resourcePreviouslyExisted   :: m Bool
+  , resourceMovedPermanently    :: m (Maybe URI)
+  , resourceMovedTemporarily    :: m (Maybe URI)
+  , resourceAllowMissingPost    :: m Bool
+  , resourceDeleteResource      :: m Bool
+  , resourceDeleteCompleted     :: m Bool
+  , resourcePostIsCreate        :: m Bool
+  , resourceCreatePath          :: m (Maybe Text)
+
+    -- Conditional requests (ETags, Last-Modified)
+  , resourceGenerateETag        :: m (Maybe ETag)
+  , resourceLastModified        :: m (Maybe UTCTime)
+  , resourceExpires             :: m (Maybe UTCTime)
+
+    -- Caching
+  , resourceOptions             :: m [Header]
+  , resourceVariances           :: m [HeaderFieldName]
+
+    -- Multiple representations
+  , resourceMultipleChoices     :: m Bool
+  }
+
+-- | Default resource with sensible defaults
+defaultResource :: Applicative m => Resource m
+defaultResource = Resource
+  { resourceServiceAvailable     = pure True
+  , resourceKnownMethods         = [mGet, mHead, mPost, mPut, mDelete, mPatch, mOptions]
+  , resourceAllowedMethods       = pure [mGet, mHead]
+  , resourceIsAuthorized         = pure Authorized
+  , resourceForbidden            = pure False
+  , resourceContentTypesProvided = pure []
+  , resourceContentTypesAccepted = pure []
+  , resourceLanguagesProvided    = pure Nothing
+  , resourceCharsetsProvided     = pure Nothing
+  , resourceEncodingsProvided    = pure Nothing
+  , resourceExists               = pure True
+  , resourcePreviouslyExisted    = pure False
+  , resourceMovedPermanently     = pure Nothing
+  , resourceMovedTemporarily     = pure Nothing
+  , resourceAllowMissingPost     = pure False
+  , resourceDeleteResource       = pure False
+  , resourceDeleteCompleted      = pure True
+  , resourcePostIsCreate         = pure False
+  , resourceCreatePath           = pure Nothing
+  , resourceGenerateETag         = pure Nothing
+  , resourceLastModified         = pure Nothing
+  , resourceExpires              = pure Nothing
+  , resourceOptions              = pure []
+  , resourceVariances            = pure []
+  , resourceMultipleChoices      = pure False
+  }
+```
+
+### 12.3 Running the Decision Tree
+
+```haskell
+-- | Execute the HTTP decision tree for a resource
+runResource :: Monad m => Resource m -> Request -> m Response
+runResource resource req = runDecisionTree decisions
+  where
+    decisions = DecisionTree
+      { dtServiceAvailable = do
+          available <- resourceServiceAvailable resource
+          if available then Right <$> continue else pure $ Left status503
+
+      , dtKnownMethod = do
+          let method = requestMethod req
+          if method `elem` resourceKnownMethods resource
+            then Right <$> continue
+            else pure $ Left status501
+
+      , dtMethodAllowed = do
+          allowed <- resourceAllowedMethods resource
+          let method = requestMethod req
+          if method `elem` allowed
+            then Right <$> continue
+            else pure $ Left $ status405WithAllow allowed
+
+      , dtAuthorized = do
+          auth <- resourceIsAuthorized resource
+          case auth of
+            Authorized -> Right <$> continue
+            Unauthorized challenge -> pure $ Left $ status401WithChallenge challenge
+
+      , dtForbidden = do
+          forbidden <- resourceForbidden resource
+          if forbidden
+            then pure $ Left status403
+            else Right <$> continue
+
+      -- ... remaining decision points
+      }
+
+-- | Type-safe decision result
+data DecisionResult
+  = Continue                         -- ^ Proceed to next decision
+  | Respond !StatusCode ![Header]    -- ^ Short-circuit with response
+  | Delegate !(m Response)           -- ^ Hand off to resource handler
+```
+
+### 12.4 Lifecycle Hooks
+
+```haskell
+-- | Hooks that can be attached at any decision point
+data LifecycleHooks m = LifecycleHooks
+  { -- Pre-decision hooks (can modify request context)
+    hookBeforeServiceCheck   :: Request -> m Request
+  , hookBeforeMethodCheck    :: Request -> m Request
+  , hookBeforeAuth           :: Request -> m Request
+  , hookBeforeContentNeg     :: Request -> m Request
+  , hookBeforeConditionals   :: Request -> m Request
+
+    -- Post-decision hooks (can observe/log but not modify flow)
+  , hookAfterServiceCheck    :: Request -> Bool -> m ()
+  , hookAfterMethodCheck     :: Request -> Bool -> m ()
+  , hookAfterAuth            :: Request -> AuthResult -> m ()
+  , hookAfterContentNeg      :: Request -> Maybe MediaType -> m ()
+
+    -- Response hooks
+  , hookBeforeResponse       :: Response -> m Response
+  , hookAfterResponse        :: Request -> Response -> m ()
+
+    -- Error hooks
+  , hookOnError              :: Request -> SomeException -> m Response
+  }
+
+-- | Apply hooks to a resource
+withHooks :: Monad m => LifecycleHooks m -> Resource m -> Resource m
+withHooks hooks resource = resource
+  { resourceServiceAvailable = do
+      req <- hookBeforeServiceCheck hooks req
+      result <- resourceServiceAvailable resource
+      hookAfterServiceCheck hooks req result
+      pure result
+  -- ... similarly for other decision points
+  }
+
+-- | Tracing hook for debugging
+tracingHooks :: MonadIO m => LifecycleHooks m
+tracingHooks = LifecycleHooks
+  { hookAfterServiceCheck = \req result ->
+      liftIO $ putStrLn $ "serviceAvailable: " <> show result
+  , hookAfterMethodCheck = \req result ->
+      liftIO $ putStrLn $ "methodAllowed: " <> show result
+  , hookAfterAuth = \req result ->
+      liftIO $ putStrLn $ "authorized: " <> show result
+  -- ...
+  }
+```
+
+### 12.5 Conditional Request Handling
+
+```haskell
+-- | Full conditional request support (RFC 7232)
+data ConditionalResult
+  = PreconditionFailed           -- ^ 412: If-Match or If-Unmodified-Since failed
+  | NotModified                  -- ^ 304: Resource hasn't changed
+  | ProceedWithRequest           -- ^ Continue processing
+
+-- | Check all conditional headers
+checkConditionals :: Resource m -> Request -> m ConditionalResult
+checkConditionals resource req = do
+  etag <- resourceGenerateETag resource
+  lastMod <- resourceLastModified resource
+
+  -- Check If-Match (for PUT/PATCH/DELETE)
+  case getRequestHeader @IfMatch req of
+    Just (IfMatch tags) ->
+      unless (matchesETag etag tags) $
+        return PreconditionFailed
+
+  -- Check If-None-Match (for GET/HEAD - caching)
+  case getRequestHeader @IfNoneMatch req of
+    Just (IfNoneMatch tags) ->
+      when (matchesETag etag tags) $
+        return NotModified
+
+  -- Check If-Modified-Since (for GET/HEAD)
+  case getRequestHeader @IfModifiedSince req of
+    Just (IfModifiedSince since) ->
+      when (maybe False (<= since) lastMod) $
+        return NotModified
+
+  -- Check If-Unmodified-Since (for PUT/PATCH/DELETE)
+  case getRequestHeader @IfUnmodifiedSince req of
+    Just (IfUnmodifiedSince since) ->
+      when (maybe False (> since) lastMod) $
+        return PreconditionFailed
+
+  return ProceedWithRequest
+
+-- | Automatically add ETag and Last-Modified to responses
+addConditionalHeaders :: Resource m -> Response -> m Response
+addConditionalHeaders resource resp = do
+  etag <- resourceGenerateETag resource
+  lastMod <- resourceLastModified resource
+  return $ resp
+    & maybe id (setResponseHeader . ETag) etag
+    & maybe id (setResponseHeader . LastModified) lastMod
+```
+
+### 12.6 Content Negotiation Engine
+
+```haskell
+-- | Full conneg implementation (RFC 7231)
+data NegotiationResult = NegotiationResult
+  { negotiatedMediaType  :: !MediaType
+  , negotiatedLanguage   :: !(Maybe LanguageTag)
+  , negotiatedCharset    :: !(Maybe Charset)
+  , negotiatedEncoding   :: !(Maybe ContentCoding)
+  }
+
+-- | Negotiate content type, language, charset, and encoding
+negotiate :: Resource m -> Request -> m (Either StatusCode NegotiationResult)
+negotiate resource req = do
+  -- Get what the resource can provide
+  mediaTypes <- resourceContentTypesProvided resource
+  languages  <- resourceLanguagesProvided resource
+  charsets   <- resourceCharsetsProvided resource
+  encodings  <- resourceEncodingsProvided resource
+
+  -- Get what the client accepts
+  let accept     = getRequestHeader @Accept req
+      acceptLang = getRequestHeader @AcceptLanguage req
+      acceptChar = getRequestHeader @AcceptCharset req
+      acceptEnc  = getRequestHeader @AcceptEncoding req
+
+  -- Perform negotiation
+  case selectMediaType accept (map fst mediaTypes) of
+    Nothing -> return $ Left status406  -- Not Acceptable
+    Just mt -> do
+      let lang = selectLanguage acceptLang =<< languages
+          char = selectCharset acceptChar =<< charsets
+          enc  = selectEncoding acceptEnc =<< encodings
+      return $ Right NegotiationResult
+        { negotiatedMediaType = mt
+        , negotiatedLanguage  = lang
+        , negotiatedCharset   = char
+        , negotiatedEncoding  = enc
+        }
+
+-- | Add Vary header based on what was negotiated
+addVaryHeader :: NegotiationResult -> Response -> Response
+addVaryHeader neg = setResponseHeader $ Vary $ catMaybes
+  [ Just hAccept
+  , hAcceptLanguage <$ negotiatedLanguage neg
+  , hAcceptCharset <$ negotiatedCharset neg
+  , hAcceptEncoding <$ negotiatedEncoding neg
+  ]
+```
+
+### 12.7 Integration with Route DSL
+
+```haskell
+-- | Embed a Resource in a route
+resource :: Monad m => Resource m -> RouteT e m Response
+resource res = RouteT $ \ctx -> do
+  response <- runResource res (rcRequest ctx)
+  pure $ Matched response
+
+-- | Define a resource inline with the route DSL
+userResource :: Int -> Resource Handler
+userResource userId = defaultResource
+  { resourceAllowedMethods = pure [mGet, mPut, mDelete]
+
+  , resourceExists = do
+      mUser <- Database.lookup userId
+      pure $ isJust mUser
+
+  , resourceContentTypesProvided = pure
+      [ (mediaTypeJson, Json <$> Database.lookup userId)
+      , (mediaTypeXml,  Xml  <$> Database.lookup userId)
+      ]
+
+  , resourceContentTypesAccepted = pure
+      [ (mediaTypeJson, do
+          body <- getRequestBody
+          case eitherDecodeStrict body of
+            Left err -> pure $ ProcessError err
+            Right user -> do
+              Database.update userId user
+              pure ProcessSucceeded)
+      ]
+
+  , resourceDeleteResource = do
+      Database.delete userId
+      pure True
+
+  , resourceGenerateETag = do
+      mUser <- Database.lookup userId
+      pure $ fmap (etagFromHash . hash) mUser
+
+  , resourceLastModified = do
+      mUser <- Database.lookup userId
+      pure $ fmap userModifiedAt mUser
+  }
+
+-- | Use in routes
+routes :: RouteT ServerError Handler Response
+routes =
+  path "users" $
+    (get >> pathEnd >> resource usersListResource)
+    <|> (capture >>= \uid -> resource (userResource uid))
+```
+
+### 12.8 Decision Tree Visualization (Debug Mode)
+
+```haskell
+-- | Generate a visualization of decisions made for a request
+data DecisionTrace = DecisionTrace
+  { traceDecisions :: [(Text, Bool, Maybe StatusCode)]
+  , traceNegotiation :: Maybe NegotiationResult
+  , traceFinalStatus :: StatusCode
+  , traceElapsedTime :: NominalDiffTime
+  }
+
+-- | Enable tracing for debugging
+withTracing :: MonadIO m => Resource m -> Resource (TracingT m)
+withTracing resource = ...
+
+-- | Pretty-print a decision trace
+renderTrace :: DecisionTrace -> Text
+renderTrace trace = T.unlines $
+  [ "HTTP Decision Trace"
+  , "==================="
+  ] ++
+  [ (if passed then "✓" else "✗") <> " " <> name <>
+    maybe "" ((" → " <>) . T.pack . show) status
+  | (name, passed, status) <- traceDecisions trace
+  ] ++
+  [ ""
+  , "Final: " <> T.pack (show $ traceFinalStatus trace)
+  , "Time: " <> T.pack (show $ traceElapsedTime trace)
+  ]
+```
+
+---
+
+## Part 13: Running Routes
+
+### 13.1 HAI Integration
+
+```haskell
+-- | Convert a route to a HAI Application
+toHAIApplication :: RouteT ServerError IO Response -> HAI.Application
+toHAIApplication route request respond = do
   let ctx = RequestContext
         { rcRequest = request
-        , rcUnmatchedPath = pathInfo request
-        , rcHeaders = headerMapFromList (requestHeaders request)
+        , rcUnmatchedPath = pathSegments (requestPath request)
+        , rcHeaders = requestHeaders request  -- Already a HeaderMap!
         , rcSettings = defaultRouteSettings
         }
   result <- runRouteT route ctx
   respond $ case result of
-    Matched resp -> toWaiResponse resp
+    Matched resp -> resp
     Rejected rej -> rejectionResponse rej
     Failed err   -> errorResponse err
 
--- | Run with the Hermes SimpleServer
-runHermesServer :: ServerSettings -> RouteT ServerError IO Response -> IO ()
-runHermesServer settings route =
-  runWithPort settings (toApplication route)
+-- | Run with any backend
+runServer :: Backend b => BackendConfig b -> RouteT ServerError IO Response -> IO ()
+runServer config route = runBackend config (toHAIApplication route)
+
+-- | Convenience for WAI/Warp (common case)
+runWarp :: Warp.Settings -> RouteT ServerError IO Response -> IO ()
+runWarp = runServer @WAIBackend
+
+-- | Convenience for raw sockets (development/testing)
+runSocket :: ServerSettings -> RouteT ServerError IO Response -> IO ()
+runSocket = runServer @SocketBackend
 ```
 
-### 10.2 Error Responses
+### 13.2 Error Responses
 
 ```haskell
 -- | Convert rejection to HTTP response
@@ -747,9 +1694,9 @@ rejectionResponse = \case
 
 ---
 
-## Part 11: Testing Support
+## Part 14: Testing Support
 
-### 11.1 Route Testing DSL
+### 14.1 Route Testing DSL
 
 ```haskell
 -- | Test context
@@ -785,7 +1732,7 @@ shouldReject (Rejected _) = pure ()
 shouldReject result = expectationFailure $ "Expected Rejected, got: " <> show result
 ```
 
-### 11.2 Property-Based Testing
+### 14.2 Property-Based Testing
 
 ```haskell
 -- | Generate valid paths for an API type
@@ -806,46 +1753,83 @@ prop_clientServerRoundTrip server = property $ do
 
 ---
 
-## Part 12: Implementation Phases
+## Part 15: Implementation Phases
 
-### Phase 1: Core Route Monad (2-3 weeks effort)
-- [ ] Implement `RouteT` monad
+### Phase 1: HAI Core & Backend Abstraction
+- [ ] Define HAI `Request` type with `HeaderMap`, interned `Method`, efficient `Path`
+- [ ] Define HAI `Response` type with type-safe headers
+- [ ] Implement `Backend` type class
+- [ ] Create WAI adapter (`toWaiApp`, `fromWaiApp`)
+- [ ] Port `SimpleServer` to be a HAI backend
+- [ ] Benchmark HAI vs WAI overhead
+
+### Phase 2: Core Route Monad
+- [ ] Implement `RouteT` monad with HAI types
 - [ ] Basic path matching (`path`, `pathEnd`, `capture`)
-- [ ] Method matching
+- [ ] Method matching using Hermes `Method` type
 - [ ] Route composition (`<|>`, `</>`)
-- [ ] WAI integration
+- [ ] Integration with HAI `Application` type
 
-### Phase 2: Header & Body Integration (2 weeks effort)
-- [ ] Header directive integration with `KnownHeader`
-- [ ] Content negotiation
+### Phase 3: Header & Body Integration
+- [ ] Header directives with `KnownHeader` and direction checking
+- [ ] Compile-time header direction validation
+- [ ] Content negotiation using existing Hermes primitives
 - [ ] Body parsing/rendering type classes
 - [ ] JSON, form, and multipart support
 
-### Phase 3: Query Parameters & Auth (1-2 weeks effort)
+### Phase 4: Template Haskell Support
+- [ ] Route quasi-quoter (`[routes|...|]`)
+- [ ] Compile-time route validation (conflicts, unreachable routes)
+- [ ] Compile-time route optimization (trie generation)
+- [ ] Reverse routing / URL generation
+- [ ] Handler type signature derivation
+- [ ] Improved compile-time error messages
+
+### Phase 5: Query Parameters & Auth
 - [ ] Query parameter extraction
 - [ ] Authentication framework
 - [ ] Authorization helpers
+- [ ] Integration with conditional headers (If-Match, etc.)
 
-### Phase 4: Type-Level API (3-4 weeks effort)
-- [ ] Type-level combinators
+### Phase 6: Webmachine Decision Tree
+- [ ] `Resource` record type with all decision points
+- [ ] `defaultResource` with sensible defaults
+- [ ] Decision tree execution engine
+- [ ] Lifecycle hooks (before/after each decision)
+- [ ] Full conditional request handling (RFC 7232)
+- [ ] Content negotiation engine (RFC 7231)
+- [ ] Decision tree tracing/visualization
+
+### Phase 7: Type-Level API
+- [ ] Type-level combinators (`:>`, `:<|>`, `Capture`, etc.)
 - [ ] Server derivation via type classes
 - [ ] Client derivation
-- [ ] OpenAPI generation
+- [ ] OpenAPI/Swagger generation
+- [ ] Integration with TH for hybrid approach
 
-### Phase 5: Testing & Middleware (1-2 weeks effort)
-- [ ] Testing DSL
-- [ ] Common middleware (logging, CORS, rate limiting)
+### Phase 8: Testing & Middleware
+- [ ] Route testing DSL
+- [ ] Property-based testing for client/server round-trips
+- [ ] HAI-level middleware (more efficient than WAI)
+- [ ] Common middleware (logging, CORS, compression, rate limiting)
 - [ ] Error handling refinement
 
-### Phase 6: Documentation & Polish (1-2 weeks effort)
+### Phase 9: Additional Backends
+- [ ] HTTP/2 backend support
+- [ ] QUIC/HTTP/3 backend (experimental)
+- [ ] Unix socket backend
+- [ ] In-memory backend for testing
+
+### Phase 10: Documentation & Polish
 - [ ] Tutorial documentation
 - [ ] API reference
-- [ ] Example applications
-- [ ] Performance benchmarks
+- [ ] Example applications (REST API, WebSocket, SSE)
+- [ ] Performance benchmarks vs WAI/Servant/Scotty
+- [ ] Migration guide from WAI
 
 ---
 
-## Part 13: Example Application
+## Part 16: Example Application
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
@@ -903,29 +1887,57 @@ createUserHandler (Json newUser) = do
   user <- liftIO $ Database.insert "users" newUser
   created (Json user)
 
--- | Main
+-- | Main using HAI with multiple backend options
 main :: IO ()
 main = do
   putStrLn "Starting server on port 8080..."
-  runHermesServer defaultSettings { port = 8080 } routes
+  -- Choose your backend:
+  -- runWarp warpSettings routes           -- Production (WAI/Warp)
+  -- runSocket socketSettings routes       -- Development
+  -- runHTTP2 http2Settings routes         -- HTTP/2
+  runWarp (Warp.setPort 8080 Warp.defaultSettings) routes
+
+-- | Alternative: Using Webmachine-style resources
+mainWebmachine :: IO ()
+mainWebmachine = do
+  let app = toHAIApplication $ path "users" $ capture >>= \uid ->
+              resource (userResourceWebmachine uid)
+  runWarp (Warp.setPort 8080 Warp.defaultSettings) app
+
+-- | User resource with full HTTP semantics
+userResourceWebmachine :: Int -> Resource Handler
+userResourceWebmachine userId = defaultResource
+  { resourceAllowedMethods = pure [mGet, mPut, mDelete]
+  , resourceExists = isJust <$> Database.lookup userId
+  , resourceContentTypesProvided = pure
+      [ (mediaTypeJson, Json <$> Database.lookup userId)
+      ]
+  , resourceGenerateETag = fmap (etagFromHash . hash) <$> Database.lookup userId
+  , resourceLastModified = fmap userModifiedAt <$> Database.lookup userId
+  }
 ```
 
 ---
 
 ## Appendix A: Comparison Matrix
 
-| Feature | Akka HTTP | Servant | Hermes (Proposed) |
-|---------|-----------|---------|-------------------|
-| Route Definition | Runtime DSL | Type-level | Both |
-| Type Safety | Moderate | Maximum | High |
-| Error Messages | Good | Complex | Good (goal) |
-| Client Generation | Manual | Automatic | Automatic |
-| Server Generation | Manual | Automatic | Automatic |
-| OpenAPI/Swagger | Plugin | Built-in | Planned |
-| Performance | Excellent | Excellent | Excellent (goal) |
-| Learning Curve | Moderate | Steep | Moderate (goal) |
-| Middleware | Directives | Combinator | Both |
-| Header Type Safety | Limited | Good | Excellent (existing) |
+| Feature | Akka HTTP | Servant | Webmachine | Hermes (Proposed) |
+|---------|-----------|---------|------------|-------------------|
+| Route Definition | Runtime DSL | Type-level | Resource callbacks | All three |
+| Type Safety | Moderate | Maximum | Low | High |
+| Error Messages | Good | Complex | Good | Good (TH-enhanced) |
+| Client Generation | Manual | Automatic | N/A | Automatic |
+| Server Generation | Manual | Automatic | N/A | Automatic |
+| OpenAPI/Swagger | Plugin | Built-in | N/A | Planned |
+| Performance | Excellent | Excellent | Excellent | Excellent (goal) |
+| Learning Curve | Moderate | Steep | Moderate | Moderate (goal) |
+| HTTP Semantics | Manual | Manual | Built-in | Built-in (Resource) |
+| Conditional Requests | Manual | Manual | Built-in | Built-in |
+| Content Negotiation | Basic | Basic | Full | Full |
+| Backend Abstraction | Akka Streams | WAI only | Cowboy | HAI (multiple) |
+| Header Type Safety | Limited | Good | None | Excellent |
+| Template Haskell | No | No | N/A | Yes |
+| Decision Tree | No | No | Yes | Yes |
 
 ---
 
@@ -933,20 +1945,85 @@ main = do
 
 ```yaml
 dependencies:
-  # Existing Hermes deps
-  - wai >= 3.2.3
-  - http-types
-  - flatparse
-  - mason
-  - symbolize
+  # Existing Hermes deps (core)
+  - flatparse        # Efficient binary parsing
+  - mason            # Fast ByteString builder
+  - symbolize        # String interning for O(1) comparison
 
-  # New routing deps
-  - aeson           # JSON support
-  - http-media      # Content negotiation
-  - http-api-data   # Path/query parsing
-  - mtl             # Monad transformers
-  - unliftio        # Async support
-  - vault           # Request-local storage
+  # HAI backends (pick what you need)
+  - wai >= 3.2.3     # WAI adapter (for Warp compatibility)
+  - warp             # Production HTTP server (via WAI)
+  - network          # Raw socket backend
+
+  # Routing & serialization
+  - aeson            # JSON support
+  - http-media       # Content negotiation
+  - http-api-data    # Path/query parsing
+
+  # Monad & async
+  - mtl              # Monad transformers
+  - unliftio         # Async support
+  - resourcet        # Resource management
+
+  # Template Haskell
+  - template-haskell # TH for route generation
+  - th-lift          # TH lifting utilities
+
+  # Optional future backends
+  - http2            # HTTP/2 support (future)
+  - quic             # QUIC/HTTP3 (future, experimental)
+```
+
+---
+
+## Appendix C: Module Structure
+
+```
+hermes/
+├── src/
+│   ├── Hermes/
+│   │   ├── HAI.hs                    -- Hermes Application Interface
+│   │   ├── HAI/
+│   │   │   ├── Request.hs            -- High-performance request type
+│   │   │   ├── Response.hs           -- Type-safe response type
+│   │   │   ├── Backend.hs            -- Backend type class
+│   │   │   └── Backend/
+│   │   │       ├── WAI.hs            -- WAI adapter
+│   │   │       ├── Socket.hs         -- Raw socket backend
+│   │   │       └── HTTP2.hs          -- HTTP/2 backend
+│   │   │
+│   │   ├── Routing.hs                -- Route DSL
+│   │   ├── Routing/
+│   │   │   ├── Monad.hs              -- RouteT monad
+│   │   │   ├── Path.hs               -- Path matching
+│   │   │   ├── Method.hs             -- Method directives
+│   │   │   ├── Header.hs             -- Header extraction
+│   │   │   ├── Body.hs               -- Body handling
+│   │   │   ├── Query.hs              -- Query parameters
+│   │   │   └── TH.hs                 -- Template Haskell support
+│   │   │
+│   │   ├── Resource.hs               -- Webmachine-style resources
+│   │   ├── Resource/
+│   │   │   ├── Decision.hs           -- Decision tree
+│   │   │   ├── Hooks.hs              -- Lifecycle hooks
+│   │   │   ├── Conditional.hs        -- Conditional requests
+│   │   │   └── Negotiation.hs        -- Content negotiation
+│   │   │
+│   │   ├── API.hs                    -- Type-level API
+│   │   ├── API/
+│   │   │   ├── Combinators.hs        -- :>, :<|>, etc.
+│   │   │   ├── Server.hs             -- Server derivation
+│   │   │   ├── Client.hs             -- Client derivation
+│   │   │   └── OpenAPI.hs            -- OpenAPI generation
+│   │   │
+│   │   └── Test.hs                   -- Testing utilities
+│   │
+│   └── Network/HTTP/                 -- Existing Hermes modules
+│       ├── Headers.hs
+│       ├── Headers/...
+│       ├── Methods.hs
+│       ├── Status.hs
+│       └── ...
 ```
 
 ---
@@ -957,5 +2034,9 @@ dependencies:
 - [Akka HTTP Directives](https://doc.akka.io/docs/akka-http/current/routing-dsl/directives/index.html)
 - [Servant Documentation](https://www.servant.dev/)
 - [Type-level Web APIs with Servant (Paper)](https://www.andres-loeh.de/Servant/servant-wgp.pdf)
+- [Webmachine](https://github.com/webmachine/webmachine) - Erlang HTTP semantic framework
+- [Webmachine Decision Diagram](https://raw.githubusercontent.com/webmachine/webmachine/develop/docs/http-headers-status-v3.png)
 - [WAI Interface](https://hackage.haskell.org/package/wai)
 - [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
+- [RFC 7232 - Conditional Requests](https://datatracker.ietf.org/doc/html/rfc7232)
+- [RFC 7231 - HTTP/1.1 Semantics and Content](https://datatracker.ietf.org/doc/html/rfc7231)
