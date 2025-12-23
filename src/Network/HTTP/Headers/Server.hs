@@ -14,6 +14,8 @@
 module Network.HTTP.Headers.Server
   ( Server (..)
   , Product (..)
+  , serverParser
+  , renderServer
   ) where
 
 import qualified Data.List.NonEmpty as NE
