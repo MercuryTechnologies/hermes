@@ -3557,95 +3557,78 @@ submitToBoundWorker worker action = do
   either throwIO pure =<< takeMVar resultVar
 ```
 
-### 18.4 NUMA-Aware Arena Allocation
+### 18.4 Leveraging GHC's NUMA Support
 
-For multi-socket servers, NUMA awareness can significantly improve performance:
+GHC's RTS has built-in NUMA support. When enabled, it automatically:
+- Pins capabilities to NUMA nodes
+- Allocates nursery and heap on NUMA-local memory
+- Schedules threads to maintain locality
 
 ```haskell
--- | NUMA node identifier
-newtype NumaNode = NumaNode Int
-  deriving (Eq, Ord, Show)
+-- Run with NUMA enabled:
+-- myapp +RTS --numa -N8
 
--- | NUMA-aware arena
-data NumaArena = NumaArena
-  { numaNode      :: !NumaNode
-  , numaArenaPtr  :: !(Ptr Word8)
-  , numaArenaSize :: !Int
-  , numaOffset    :: !(IORef Int)
+-- Our worker pool just needs to pin to capabilities;
+-- the RTS handles NUMA-local allocation automatically
+data WorkerPool = WorkerPool
+  { poolWorkers :: !(Vector PinnedWorker)
+  , poolSize    :: !Int
   }
 
--- | Allocate memory on specific NUMA node
--- Uses libnuma via FFI
-foreign import ccall unsafe "numa_alloc_onnode"
-  numa_alloc_onnode :: CSize -> CInt -> IO (Ptr a)
-
-foreign import ccall unsafe "numa_free"
-  numa_free :: Ptr a -> CSize -> IO ()
-
--- | Create arena on specific NUMA node
-createNumaArena :: NumaNode -> Int -> IO NumaArena
-createNumaArena node@(NumaNode n) size = do
-  ptr <- numa_alloc_onnode (fromIntegral size) (fromIntegral n)
-  when (ptr == nullPtr) $ throwIO $ userError "NUMA allocation failed"
-  ref <- newIORef 0
-  pure $ NumaArena node ptr size ref
-
--- | NUMA-aware worker pool
-data NumaWorkerPool = NumaWorkerPool
-  { numaWorkers :: !(Vector (Vector PinnedWorker))  -- Per-node workers
-  , numaMapping :: !(IntMap NumaNode)               -- Capability -> NUMA node
-  }
-
--- | Create NUMA-aware pool
--- Queries NUMA topology and pins workers appropriately
-createNumaWorkerPool :: Int -> IO NumaWorkerPool
-createNumaWorkerPool arenaSize = do
-  numNodes <- getNumNumaNodes
+-- | Create worker pool - one per capability
+-- Memory allocated by each worker will be NUMA-local
+-- when running with +RTS --numa
+createWorkerPool :: Int -> IO WorkerPool
+createWorkerPool arenaSize = do
   numCaps <- getNumCapabilities
+  workers <- V.generateM numCaps $ \cap -> do
+    -- malloc here will be NUMA-local when running on that capability
+    -- due to RTS NUMA support
+    arena <- mallocBytes arenaSize
+    ref <- newIORef 0
+    pure $ PinnedWorker cap arena arenaSize ref cap
+  pure $ WorkerPool workers numCaps
 
-  -- Get NUMA node for each capability
-  numaMap <- IM.fromList <$> forM [0..numCaps-1] (\cap -> do
-    node <- getNumaNodeForCapability cap
-    pure (cap, NumaNode node))
+-- | Run on specific capability - RTS ensures NUMA locality
+withPinnedArena :: WorkerPool -> Int -> (forall r. Arena r -> IO a) -> IO a
+withPinnedArena pool idx action = do
+  let worker = poolWorkers pool V.! (idx `mod` poolSize pool)
+  writeIORef (workerArenaRef worker) 0  -- Reset arena
 
-  -- Create workers grouped by NUMA node
-  workers <- V.generateM numNodes $ \node -> do
-    let capsOnNode = [c | (c, NumaNode n) <- IM.toList numaMap, n == node]
-    V.fromList <$> forM capsOnNode (\cap -> do
-      arena <- numa_alloc_onnode (fromIntegral arenaSize) (fromIntegral node)
-      ref <- newIORef 0
-      pure $ PinnedWorker cap arena arenaSize ref cap)
+  -- forkOn pins to capability; RTS NUMA support handles memory locality
+  resultVar <- newEmptyMVar
+  _ <- forkOn (workerCapability worker) $ do
+    result <- action (Arena (workerArena worker) (workerArenaSize worker) (workerArenaRef worker))
+    putMVar resultVar result
+  takeMVar resultVar
 
-  pure $ NumaWorkerPool workers numaMap
-
--- | Foreign imports for NUMA queries
-foreign import ccall unsafe "numa_num_configured_nodes"
-  getNumNumaNodes :: IO Int
-
-foreign import ccall unsafe "numa_node_of_cpu"
-  numa_node_of_cpu :: CInt -> IO CInt
-
-getNumaNodeForCapability :: Int -> IO Int
-getNumaNodeForCapability cap = fromIntegral <$> numa_node_of_cpu (fromIntegral cap)
+-- For explicit NUMA queries (rarely needed):
+-- Use GHC.RTS.Flags to check if NUMA is enabled
+-- Use GHC.Conc to query capability count
 ```
 
-### 18.5 Arena Pooling with HAI Backends
+**Deployment notes:**
+- Enable with `+RTS --numa` or `+RTS --numa=<nodes>`
+- Combine with `-N` to set capability count
+- The RTS queries `/sys/devices/system/node/` on Linux
+- Works automatically - no application code changes needed
 
-See Part 10.5 (Backend Adapters with Arena Integration) for the primary
-integration of arenas with HAI backends. This section covers additional
-pooling strategies for advanced scenarios.
+### 18.5 Hybrid Worker Pool (Pinned + Bound)
+
+See Part 10.5 for basic arena integration. This section covers hybrid
+pooling when some requests need bound threads for C library TLS.
 
 ```haskell
--- | Extended pool configuration for NUMA + bound thread hybrid
+-- | Hybrid pool: pinned workers for speed, bound workers for TLS
 data HybridPool = HybridPool
-  { hpNumaPool   :: !NumaWorkerPool      -- Per-NUMA-node pinned arenas
-  , hpBoundPool  :: !(Vector BoundWorker) -- Bound threads for TLS-needing code
-  , hpDispatcher :: !(IORef Int)          -- Round-robin counter
+  { hpPinnedPool  :: !WorkerPool           -- Fast path: forkOn workers
+  , hpBoundPool   :: !(Vector BoundWorker) -- Slow path: forkOS for TLS
+  , hpDispatcher  :: !(IORef Int)          -- Round-robin counter
   }
 
--- | Dispatch with NUMA preference but fallback to bound thread
--- Use case: Most requests use fast NUMA-local arenas, but some need
--- true TLS for C library calls (e.g., OpenSSL, database drivers)
+-- | Dispatch based on TLS requirement
+-- Most requests use fast pinned workers; some need bound threads
+-- for C libraries that use thread-local storage (OpenSSL, some DB drivers)
 dispatchHybrid :: HybridPool
                -> Bool  -- ^ Does this request need TLS?
                -> (forall r. RouteT r e IO a)
@@ -3659,21 +3642,21 @@ dispatchHybrid pool needsTLS action = do
       let worker = hpBoundPool pool V.! (idx `mod` V.length (hpBoundPool pool))
       submitToBoundWorker worker $ withLocalArena action
     else do
-      -- Route to NUMA-local pinned worker
-      cap <- getCurrentCapability
-      let node = numaMapping (hpNumaPool pool) IM.! cap
-          workers = numaWorkers (hpNumaPool pool) V.! fromIntegral node
-          worker = workers V.! (idx `mod` V.length workers)
-      withPinnedArena' worker action
+      -- Route to pinned worker (fast path)
+      withPinnedArena (hpPinnedPool pool) idx $ \arena ->
+        runRouteT' arena action
 
--- | Query which requests need TLS (configured per-route)
-newtype NeedsTLS = NeedsTLS Bool
-
+-- | Mark routes that need TLS (e.g., calling OpenSSL directly)
 class HasTLSRequirement a where
   needsTLS :: a -> Bool
 
-instance HasTLSRequirement Resource where
-  needsTLS r = resourceNeedsTLS r  -- New field on Resource
+-- | Default: most routes don't need TLS
+instance HasTLSRequirement (RouteT r e m a) where
+  needsTLS _ = False
+
+-- | Resources can declare TLS requirement
+instance HasTLSRequirement (Resource r m) where
+  needsTLS = resourceNeedsTLS  -- Optional field, defaults to False
 ```
 
 ### 18.6 Chunked Arena for Large Requests
@@ -3870,7 +3853,6 @@ dependencies:
 
   # Arena & linear types (optional advanced features)
   - linear-base        # Linear types support (GHC 9.0+)
-  - numa               # NUMA-aware allocation (optional)
 
   # OpenTelemetry
   - hs-opentelemetry-api          # OTel API
