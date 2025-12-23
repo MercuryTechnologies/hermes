@@ -57,14 +57,11 @@ import Control.Applicative (optional)
 import Data.Bits (shiftL, (.|.))
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
-import qualified Data.ByteString.Builder as BB
-import qualified Data.ByteString.Lazy as BL
-import Data.Char (chr, digitToInt, intToDigit, isAsciiLower, isAsciiUpper, isDigit, isHexDigit, ord, toLower, toUpper)
+import Data.Char (chr, isAsciiLower, isAsciiUpper, isHexDigit)
 import Data.CharSet (CharSet)
 import qualified Data.CharSet as CharSet
-import Data.CharSet.Posix.Ascii (alnum, alpha, digit)
+import Data.CharSet.Posix.Ascii (alnum)
 import Data.Text (Text)
-import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
 import Data.Text.Short (ShortText)
 import qualified Data.Text.Short as ST
@@ -142,20 +139,14 @@ newtype UserInfo = UserInfo { unUserInfo :: ShortText }
   deriving stock (Eq, Show)
 
 -- | URI path component.
---
--- Stored in percent-decoded form.
 newtype Path = Path { unPath :: ShortText }
   deriving stock (Eq, Show)
 
 -- | URI query component (after ?).
---
--- Stored in percent-decoded form.
 newtype Query = Query { unQuery :: ShortText }
   deriving stock (Eq, Show)
 
 -- | URI fragment component (after #).
---
--- Stored in percent-decoded form.
 newtype Fragment = Fragment { unFragment :: ShortText }
   deriving stock (Eq, Show)
 
@@ -164,70 +155,34 @@ newtype Fragment = Fragment { unFragment :: ShortText }
 -------------------------------------------------------------------------------
 
 -- | Unreserved characters per RFC 3986.
---
--- @
--- unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
--- @
 unreservedCharSet :: CharSet
 unreservedCharSet = alnum <> "-._~"
 
 -- | Sub-delimiters per RFC 3986.
---
--- @
--- sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
--- @
 subDelimsCharSet :: CharSet
 subDelimsCharSet = "!$&'()*+,;="
 
 -- | General delimiters per RFC 3986.
---
--- @
--- gen-delims = ":" / "/" / "?" / "#" / "[" / "]" / "\@"
--- @
 genDelimsCharSet :: CharSet
 genDelimsCharSet = ":/?#[]@"
 
 -- | Characters allowed in scheme.
---
--- @
--- scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
--- @
 schemeCharSet :: CharSet
 schemeCharSet = alnum <> "+-."
 
 -- | Characters allowed in userinfo (unencoded).
---
--- @
--- userinfo = *( unreserved / pct-encoded / sub-delims / ":" )
--- @
 userInfoCharSet :: CharSet
 userInfoCharSet = unreservedCharSet <> subDelimsCharSet <> ":"
 
 -- | Characters allowed in host reg-name (unencoded).
---
--- @
--- reg-name = *( unreserved / pct-encoded / sub-delims )
--- @
 regNameCharSet :: CharSet
 regNameCharSet = unreservedCharSet <> subDelimsCharSet
 
 -- | Characters allowed in path segment (unencoded).
---
--- @
--- pchar = unreserved / pct-encoded / sub-delims / ":" / "\@"
--- @
 pcharCharSet :: CharSet
 pcharCharSet = unreservedCharSet <> subDelimsCharSet <> ":@"
 
--- | Characters allowed in path (unencoded).
-pathCharSet :: CharSet
-pathCharSet = pcharCharSet <> "/"
-
 -- | Characters allowed in query/fragment (unencoded).
---
--- @
--- query / fragment = *( pchar / "/" / "?" )
--- @
 queryFragmentCharSet :: CharSet
 queryFragmentCharSet = pcharCharSet <> "/?"
 
@@ -260,8 +215,6 @@ parseURI bs = case runParser uriParser bs of
   Err e -> Left e
 
 -- | Parse a URI-reference from a ByteString.
---
--- A URI-reference is either a URI or a relative-reference.
 parseURIReference :: ByteString -> Either String URI
 parseURIReference bs = case runParser uriReferenceParser bs of
   OK uri "" -> Right uri
@@ -270,10 +223,6 @@ parseURIReference bs = case runParser uriReferenceParser bs of
   Err e -> Left e
 
 -- | Parse a complete URI.
---
--- @
--- URI = scheme ":" hier-part [ "?" query ] [ "#" fragment ]
--- @
 uriParser :: ParserT st String URI
 uriParser = do
   scheme <- schemeParser
@@ -288,10 +237,6 @@ uriReferenceParser :: ParserT st String URI
 uriReferenceParser = uriParser <|> relativeRefParser
 
 -- | Parse a relative-reference.
---
--- @
--- relative-ref = relative-part [ "?" query ] [ "#" fragment ]
--- @
 relativeRefParser :: ParserT st String URI
 relativeRefParser = do
   (auth, path) <- relativePartParser
@@ -299,26 +244,15 @@ relativeRefParser = do
   fragment <- optional ($(char '#') *> fragmentParser)
   pure $ URI (Scheme "") auth path query fragment
 
--- | Parse scheme.
---
--- @
--- scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
--- @
+-- | Parse scheme - uses shortASCIIFromParser_ to avoid String allocation.
 schemeParser :: ParserT st String Scheme
-schemeParser = do
-  first <- satisfyAscii isAsciiAlpha
-  rest <- many (satisfyAscii (`CharSet.member` schemeCharSet))
-  let scheme = ST.pack (first : rest)
-  pure $ Scheme scheme
+schemeParser = Scheme <$> shortASCIIFromParser_ schemeChars
+  where
+    schemeChars = do
+      skipSatisfyAscii isAsciiAlpha
+      skipMany (skipSatisfyAscii (`CharSet.member` schemeCharSet))
 
 -- | Parse hier-part.
---
--- @
--- hier-part = "//" authority path-abempty
---           / path-absolute
---           / path-rootless
---           / path-empty
--- @
 hierPartParser :: ParserT st String (Maybe URIAuth, Path)
 hierPartParser = withAuth <|> pathOnly
   where
@@ -345,10 +279,6 @@ relativePartParser = withAuth <|> pathOnly
       pure (Nothing, path)
 
 -- | Parse authority.
---
--- @
--- authority = [ userinfo "\@" ] host [ ":" port ]
--- @
 authorityParser :: ParserT st String URIAuth
 authorityParser = do
   userInfo <- optional (userInfoParser <* $(char '@'))
@@ -356,175 +286,127 @@ authorityParser = do
   port <- optional ($(char ':') *> portParser)
   pure $ URIAuth userInfo host port
 
--- | Parse userinfo.
+-- | Parse userinfo - captures bytes directly.
 userInfoParser :: ParserT st String UserInfo
-userInfoParser = do
-  chars <- many (pctEncodedOrChar userInfoCharSet)
-  pure $ UserInfo $ ST.pack chars
+userInfoParser = UserInfo <$> shortASCIIFromParser_ (skipMany userInfoChar)
+  where
+    userInfoChar = skipSatisfyAscii (`CharSet.member` userInfoCharSet) <|> pctEncodedSkip
 
 -- | Parse host.
---
--- @
--- host = IP-literal / IPv4address / reg-name
--- @
 hostParser :: ParserT st String Host
 hostParser = ipLiteralParser <|> ipv4Parser <|> regNameParser
 
 -- | Parse IP-literal (IPv6 or IPvFuture).
 ipLiteralParser :: ParserT st String Host
 ipLiteralParser = do
-  $(char '[')
-  content <- shortASCIIFromParser_ $ many (satisfyAscii isIPLiteralChar)
-  $(char ']')
-  pure $ HostIPv6 ("[" <> content <> "]")
+  content <- shortASCIIFromParser_ $ do
+    $(char '[')
+    skipMany (skipSatisfyAscii isIPLiteralChar)
+    $(char ']')
+  pure $ HostIPv6 content
   where
     isIPLiteralChar c = isHexDigit c || c == ':' || c == '.'
 
--- | Parse IPv4 address.
+-- | Parse IPv4 address - uses anyAsciiDecimalWord for efficiency.
 ipv4Parser :: ParserT st String Host
 ipv4Parser = do
-  -- Look ahead to check it's a valid IPv4
-  o1 <- decOctet
-  $(char '.')
-  o2 <- decOctet
-  $(char '.')
-  o3 <- decOctet
-  $(char '.')
-  o4 <- decOctet
+  addr <- shortASCIIFromParser_ $ do
+    decOctet >> $(char '.') >> decOctet >> $(char '.') >> decOctet >> $(char '.') >> decOctet
   -- Make sure it's not followed by more reg-name chars
   lookahead $ optional $ satisfyAscii (\c -> not (c `CharSet.member` regNameCharSet) && c /= '%')
-  let addr = ST.pack $ show o1 <> "." <> show o2 <> "." <> show o3 <> "." <> show o4
   pure $ HostIPv4 addr
   where
-    decOctet :: ParserT st String Int
+    decOctet :: ParserT st String ()
     decOctet = do
-      digits <- some (satisfyAscii isDigit)
-      let n = read digits
+      n <- anyAsciiDecimalWord
       if n > 255
         then err "IPv4 octet out of range"
-        else pure n
+        else pure ()
 
 -- | Parse reg-name (registered name / domain).
 regNameParser :: ParserT st String Host
 regNameParser = do
-  chars <- many (pctEncodedOrChar regNameCharSet)
-  let ascii = ST.pack chars
-      asciiText = ST.toText ascii
+  ascii <- shortASCIIFromParser_ (skipMany regNameChar)
+  let asciiText = ST.toText ascii
   -- Try to decode as Punycode to get Unicode form
   let unicodeForm = case IDN.toUnicode asciiText of
         Right unicode | unicode /= asciiText -> Just unicode
         _ -> Nothing
   pure $ HostRegName ascii unicodeForm
+  where
+    regNameChar = skipSatisfyAscii (`CharSet.member` regNameCharSet) <|> pctEncodedSkip
 
--- | Parse port.
+-- | Parse port - uses anyAsciiDecimalWord for efficiency.
 portParser :: ParserT st String Port
 portParser = do
-  digits <- some (satisfyAscii isDigit)
-  let n = read digits :: Int
+  n <- anyAsciiDecimalWord
   if n > 65535
     then err "Port number out of range"
     else pure $ Port (fromIntegral n)
 
 -- | Parse path-abempty (may be empty).
---
--- @
--- path-abempty = *( "/" segment )
--- @
 pathAbemptyParser :: ParserT st String Path
-pathAbemptyParser = do
-  segments <- many ($(char '/') *> segmentParser)
-  let path = case segments of
-        [] -> ""
-        _ -> ST.pack $ "/" <> intercalate' "/" segments
-  pure $ Path path
+pathAbemptyParser = Path <$> shortASCIIFromParser_ (skipMany segment)
+  where
+    segment = $(char '/') >> skipMany pcharSkip
 
 -- | Parse path-absolute.
---
--- @
--- path-absolute = "/" [ segment-nz *( "/" segment ) ]
--- @
 pathAbsoluteParser :: ParserT st String Path
-pathAbsoluteParser = do
-  $(char '/')
-  rest <- optional $ do
-    first <- segmentNzParser
-    more <- many ($(char '/') *> segmentParser)
-    pure (first : more)
-  let path = case rest of
-        Nothing -> "/"
-        Just segs -> ST.pack $ "/" <> intercalate' "/" segs
-  pure $ Path path
+pathAbsoluteParser = Path <$> shortASCIIFromParser_ pathContent
+  where
+    pathContent = do
+      $(char '/')
+      optional_ $ do
+        skipSome pcharSkip  -- segment-nz
+        skipMany ($(char '/') >> skipMany pcharSkip)
 
 -- | Parse path-rootless.
---
--- @
--- path-rootless = segment-nz *( "/" segment )
--- @
 pathRootlessParser :: ParserT st String Path
-pathRootlessParser = do
-  first <- segmentNzParser
-  more <- many ($(char '/') *> segmentParser)
-  let path = ST.pack $ intercalate' "/" (first : more)
-  pure $ Path path
+pathRootlessParser = Path <$> shortASCIIFromParser_ pathContent
+  where
+    pathContent = do
+      skipSome pcharSkip  -- segment-nz
+      skipMany ($(char '/') >> skipMany pcharSkip)
 
 -- | Parse path-noscheme (for relative-ref).
---
--- @
--- path-noscheme = segment-nz-nc *( "/" segment )
--- @
 pathNoSchemeParser :: ParserT st String Path
-pathNoSchemeParser = do
-  first <- segmentNzNcParser
-  more <- many ($(char '/') *> segmentParser)
-  let path = ST.pack $ intercalate' "/" (first : more)
-  pure $ Path path
+pathNoSchemeParser = Path <$> shortASCIIFromParser_ pathContent
+  where
+    pathContent = do
+      skipSome segmentNzNcChar  -- segment-nz-nc (no colon)
+      skipMany ($(char '/') >> skipMany pcharSkip)
+    segmentNzNcChar = skipSatisfyAscii (`CharSet.member` (pcharCharSet CharSet.\\ ":")) <|> pctEncodedSkip
 
 -- | Parse empty path.
 pathEmptyParser :: ParserT st String Path
 pathEmptyParser = pure $ Path ""
 
--- | Parse segment.
-segmentParser :: ParserT st String String
-segmentParser = many (pctEncodedOrChar pcharCharSet)
-
--- | Parse segment-nz (non-zero length segment).
-segmentNzParser :: ParserT st String String
-segmentNzParser = some (pctEncodedOrChar pcharCharSet)
-
--- | Parse segment-nz-nc (non-zero, no colon).
-segmentNzNcParser :: ParserT st String String
-segmentNzNcParser = some (pctEncodedOrChar (pcharCharSet CharSet.\\ ":"))
-
 -- | Parse query.
 queryParser :: ParserT st String Query
-queryParser = do
-  chars <- many (pctEncodedOrChar queryFragmentCharSet)
-  pure $ Query $ ST.pack chars
+queryParser = Query <$> shortASCIIFromParser_ (skipMany queryChar)
+  where
+    queryChar = skipSatisfyAscii (`CharSet.member` queryFragmentCharSet) <|> pctEncodedSkip
 
 -- | Parse fragment.
 fragmentParser :: ParserT st String Fragment
-fragmentParser = do
-  chars <- many (pctEncodedOrChar queryFragmentCharSet)
-  pure $ Fragment $ ST.pack chars
+fragmentParser = Fragment <$> shortASCIIFromParser_ (skipMany fragmentChar)
+  where
+    fragmentChar = skipSatisfyAscii (`CharSet.member` queryFragmentCharSet) <|> pctEncodedSkip
 
--- | Parse either a percent-encoded character or a literal character from the set.
-pctEncodedOrChar :: CharSet -> ParserT st String Char
-pctEncodedOrChar allowed = pctEncodedChar <|> satisfyAscii (`CharSet.member` allowed)
+-- | Skip a pchar (path character).
+pcharSkip :: ParserT st String ()
+pcharSkip = skipSatisfyAscii (`CharSet.member` pcharCharSet) <|> pctEncodedSkip
 
--- | Parse a percent-encoded character.
-pctEncodedChar :: ParserT st String Char
-pctEncodedChar = do
+-- | Skip a percent-encoded sequence.
+pctEncodedSkip :: ParserT st String ()
+pctEncodedSkip = do
   $(char '%')
-  h1 <- satisfyAscii isHexDigit
-  h2 <- satisfyAscii isHexDigit
-  let byte = (digitToInt h1 `shiftL` 4) .|. digitToInt h2
-  pure $ chr byte
+  skipSatisfyAscii isHexDigit
+  skipSatisfyAscii isHexDigit
 
--- | Helper for intercalating strings.
-intercalate' :: String -> [String] -> String
-intercalate' _ [] = ""
-intercalate' _ [x] = x
-intercalate' sep (x:xs) = x <> sep <> intercalate' sep xs
+-- | Optional that returns unit.
+optional_ :: ParserT st e a -> ParserT st e ()
+optional_ p = (p >> pure ()) <|> pure ()
 
 -- | Check if character is ASCII alpha.
 isAsciiAlpha :: Char -> Bool
@@ -574,28 +456,41 @@ mkHostFromUnicode txt = case IDN.toASCII txt of
 -- Percent Encoding/Decoding
 -------------------------------------------------------------------------------
 
--- | Percent-encode a string for a given character set.
---
--- Characters in the set are left as-is; others are percent-encoded.
+-- | Percent-encode text for a given character set.
 percentEncode :: CharSet -> Text -> Text
-percentEncode allowed = T.concatMap encodeChar
+percentEncode allowed = TE.decodeUtf8 . B.concatMap encodeByte . TE.encodeUtf8
   where
-    encodeChar c
-      | c `CharSet.member` allowed = T.singleton c
-      | ord c < 128 = T.pack $ '%' : toHex (ord c)
-      | otherwise = T.concat $ map (T.pack . ('%':) . toHex . fromIntegral) (B.unpack $ TE.encodeUtf8 $ T.singleton c)
-    toHex n = [intToDigit (n `div` 16), intToDigit (n `mod` 16)]
+    encodeByte :: Word8 -> ByteString
+    encodeByte b
+      | b < 128 && chr (fromIntegral b) `CharSet.member` allowed = B.singleton b
+      | otherwise = B.pack [0x25, toHexUpper (b `div` 16), toHexUpper (b `mod` 16)]  -- 0x25 = '%'
+    toHexUpper n
+      | n < 10 = 0x30 + n  -- '0'
+      | otherwise = 0x41 + n - 10  -- 'A'
 
--- | Percent-decode a string.
+-- | Percent-decode text.
 percentDecode :: Text -> Text
-percentDecode = TE.decodeUtf8 . B.pack . go . T.unpack
+percentDecode = TE.decodeUtf8 . percentDecodeBS . TE.encodeUtf8
+
+-- | Percent-decode a ByteString.
+percentDecodeBS :: ByteString -> ByteString
+percentDecodeBS bs = B.pack $ go (B.unpack bs)
   where
     go [] = []
-    go ('%':h1:h2:rest)
-      | isHexDigit h1 && isHexDigit h2 =
-          let byte = fromIntegral $ (digitToInt h1 `shiftL` 4) .|. digitToInt h2
+    go (0x25:h1:h2:rest)  -- '%'
+      | isHexDigitW8 h1 && isHexDigitW8 h2 =
+          let byte = (fromHex h1 `shiftL` 4) .|. fromHex h2
           in byte : go rest
-    go (c:rest) = fromIntegral (ord c) : go rest
+    go (b:rest) = b : go rest
+
+    isHexDigitW8 b = (b >= 0x30 && b <= 0x39) ||  -- 0-9
+                     (b >= 0x41 && b <= 0x46) ||  -- A-F
+                     (b >= 0x61 && b <= 0x66)     -- a-f
+
+    fromHex b
+      | b >= 0x30 && b <= 0x39 = b - 0x30        -- 0-9
+      | b >= 0x41 && b <= 0x46 = b - 0x41 + 10   -- A-F
+      | otherwise = b - 0x61 + 10                -- a-f
 
 -------------------------------------------------------------------------------
 -- Rendering
