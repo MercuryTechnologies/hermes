@@ -558,6 +558,156 @@ createUser :: NewUser -> ClientM User
 (listUsers :<|> getUser :<|> createUser :<|> _ :<|> _) = client (Proxy @UserAPI)
 ```
 
+### 7.5 Record-Based Routes (NamedRoutes Style)
+
+Inspired by [Servant's NamedRoutes](https://www.tweag.io/blog/2022-02-24-named-routes/),
+Hermes supports a more ergonomic record-based API definition. This approach:
+- Provides named field accessors for client functions (no pattern matching needed)
+- Supports nested API composition via records
+- Produces cleaner type errors
+- Works with Generic deriving
+
+```haskell
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE DataKinds #-}
+
+-- | Mode type for API interpretation
+data RouteMode = AsAPI | AsServer Type | AsClient Type
+
+-- | Type family that interprets routes based on mode
+type family (:-) (mode :: RouteMode) (api :: Type) :: Type where
+  AsAPI       :- api = api
+  AsServer m  :- api = ServerT api m
+  AsClient m  :- api = ClientT api m
+
+-- | Record-based API definition
+data UserRoutes mode = UserRoutes
+  { _listUsers  :: mode :- Get '[JSON] [User]
+  , _getUser    :: mode :- Capture "id" UserId :> Get '[JSON] User
+  , _createUser :: mode :- ReqBody '[JSON] NewUser :> Post '[JSON] User
+  , _updateUser :: mode :- Capture "id" UserId :> ReqBody '[JSON] UpdateUser :> Put '[JSON] User
+  , _deleteUser :: mode :- Capture "id" UserId :> Delete '[JSON] NoContent
+  } deriving (Generic)
+
+-- | Nested API with multiple resources
+data APIRoutes mode = APIRoutes
+  { _users    :: mode :- "users" :> NamedRoutes UserRoutes
+  , _posts    :: mode :- "posts" :> NamedRoutes PostRoutes
+  , _health   :: mode :- "health" :> Get '[PlainText] Text
+  , _metrics  :: mode :- "metrics" :> Get '[PlainText] Text
+  } deriving (Generic)
+
+-- | Top-level API type
+type API = "api" :> "v1" :> NamedRoutes APIRoutes
+```
+
+#### Server Implementation with Records
+
+```haskell
+-- | Server handlers as a record - much cleaner than :<|> chains!
+userHandlers :: UserRoutes (AsServer Handler)
+userHandlers = UserRoutes
+  { _listUsers  = Database.getAllUsers
+  , _getUser    = Database.getUser
+  , _createUser = Database.createUser
+  , _updateUser = Database.updateUser
+  , _deleteUser = Database.deleteUser
+  }
+
+apiHandlers :: APIRoutes (AsServer Handler)
+apiHandlers = APIRoutes
+  { _users   = userHandlers
+  , _posts   = postHandlers
+  , _health  = pure "OK"
+  , _metrics = getMetrics
+  }
+
+-- | Convert record to route
+server :: RouteT ServerError Handler Response
+server = genericServer (Proxy @API) apiHandlers
+```
+
+#### Client Functions with Records
+
+```haskell
+-- | Client as a record - named fields, no pattern matching!
+apiClient :: APIRoutes (AsClient ClientM)
+apiClient = genericClient (Proxy @API)
+
+-- | Use client functions directly by field name
+example :: ClientM [User]
+example = do
+  -- Named access - much clearer than positional!
+  users <- _listUsers (_users apiClient)
+
+  -- Nested access
+  user <- _getUser (_users apiClient) (UserId 42)
+
+  -- Health check
+  _ <- _health apiClient
+
+  pure users
+```
+
+#### Generic Derivation
+
+```haskell
+-- | Type class for generic route derivation
+class GServantProduct f where
+  type GToServant f :: Type
+  gToServant :: f p -> GToServant f
+  gFromServant :: GToServant f -> f p
+
+-- | Convert record to :<|> tree
+class GenericRoutes routes where
+  type ToServantApi routes :: Type
+  genericApi :: routes AsAPI -> ToServantApi routes
+
+-- | Derive server from record
+genericServer :: forall api routes m.
+  ( GenericRoutes routes
+  , HasServer (ToServantApi routes)
+  ) => Proxy api -> routes (AsServer m) -> ServerT (ToServantApi routes) m
+
+-- | Derive client from record
+genericClient :: forall api routes m.
+  ( GenericRoutes routes
+  , HasClient (ToServantApi routes)
+  ) => Proxy api -> routes (AsClient m)
+```
+
+#### Nested Routes with Authentication
+
+```haskell
+-- | Public routes (no auth required)
+data PublicRoutes mode = PublicRoutes
+  { _login    :: mode :- "login" :> ReqBody '[JSON] Credentials :> Post '[JSON] Token
+  , _register :: mode :- "register" :> ReqBody '[JSON] NewUser :> Post '[JSON] User
+  , _health   :: mode :- "health" :> Get '[PlainText] Text
+  } deriving (Generic)
+
+-- | Protected routes (auth required)
+data ProtectedRoutes mode = ProtectedRoutes
+  { _profile  :: mode :- "profile" :> Get '[JSON] User
+  , _settings :: mode :- "settings" :> NamedRoutes SettingsRoutes
+  , _admin    :: mode :- "admin" :> NamedRoutes AdminRoutes
+  } deriving (Generic)
+
+-- | Combined API with auth boundary
+data AppRoutes mode = AppRoutes
+  { _public    :: mode :- "public" :> NamedRoutes PublicRoutes
+  , _protected :: mode :- "protected" :> AuthProtect "jwt" :> NamedRoutes ProtectedRoutes
+  } deriving (Generic)
+
+-- | Server with auth handling
+appServer :: AppRoutes (AsServer Handler)
+appServer = AppRoutes
+  { _public = publicHandlers
+  , _protected = \authUser -> protectedHandlers authUser  -- Auth user passed in!
+  }
+```
+
 ---
 
 ## Part 8: Template Haskell Support
@@ -767,6 +917,147 @@ validateRoutesTH routes = do
       , "These routes would match the same request."
       , "Consider making one more specific or combining them."
       ]
+```
+
+### 8.9 Runtime Route Overlap Detection (Non-TH)
+
+For cases where TH isn't desired or possible, Hermes provides runtime route analysis
+that can be run at application startup. This ensures manually constructed routes
+also benefit from conflict detection.
+
+```haskell
+-- | Route specification for analysis
+data RouteSpec = RouteSpec
+  { routeMethod   :: !Method
+  , routePattern  :: !PathPattern
+  , routeHandler  :: !Text  -- Handler name for error messages
+  }
+
+-- | Path pattern for matching analysis
+data PathPattern
+  = StaticSegment !Text PathPattern
+  | CaptureSegment !TypeRep PathPattern  -- TypeRep for type info
+  | WildcardSegment                      -- Matches rest of path
+  | EndOfPath
+  deriving (Eq, Show)
+
+-- | Result of route analysis
+data RouteAnalysis = RouteAnalysis
+  { analysisConflicts    :: ![(RouteSpec, RouteSpec, ConflictType)]
+  , analysisUnreachable  :: ![RouteSpec]
+  , analysisShadowed     :: ![(RouteSpec, RouteSpec)]  -- (shadowed, by)
+  , analysisWarnings     :: ![Text]
+  }
+
+data ConflictType
+  = Ambiguous        -- ^ Two routes could match the same request
+  | MethodOverlap    -- ^ Same path, overlapping methods
+  | CaptureConflict  -- ^ Different capture types at same position
+  deriving (Show, Eq)
+
+-- | Analyze routes for conflicts (pure function, no TH required)
+analyzeRoutes :: [RouteSpec] -> RouteAnalysis
+analyzeRoutes routes = RouteAnalysis
+  { analysisConflicts   = findConflicts routes
+  , analysisUnreachable = findUnreachable routes
+  , analysisShadowed    = findShadowed routes
+  , analysisWarnings    = generateWarnings routes
+  }
+
+-- | Check if two path patterns could match the same path
+couldOverlap :: PathPattern -> PathPattern -> Bool
+couldOverlap EndOfPath EndOfPath = True
+couldOverlap WildcardSegment _ = True
+couldOverlap _ WildcardSegment = True
+couldOverlap (StaticSegment a rest1) (StaticSegment b rest2)
+  | a == b    = couldOverlap rest1 rest2
+  | otherwise = False
+couldOverlap (CaptureSegment _ rest1) (CaptureSegment _ rest2) =
+  couldOverlap rest1 rest2
+couldOverlap (CaptureSegment _ rest1) (StaticSegment _ rest2) =
+  couldOverlap rest1 rest2  -- Capture matches static
+couldOverlap (StaticSegment _ rest1) (CaptureSegment _ rest2) =
+  couldOverlap rest1 rest2  -- Static matches capture
+couldOverlap _ _ = False
+
+-- | Validate routes at startup, failing fast on conflicts
+validateRoutesOrFail :: MonadIO m => [RouteSpec] -> m ()
+validateRoutesOrFail routes = do
+  let analysis = analyzeRoutes routes
+  unless (null $ analysisConflicts analysis) $ liftIO $ do
+    forM_ (analysisConflicts analysis) $ \(r1, r2, conflictType) ->
+      hPutStrLn stderr $ unlines
+        [ "ERROR: Route conflict (" <> show conflictType <> "):"
+        , "  " <> show (routeMethod r1) <> " " <> showPattern (routePattern r1)
+        , "    -> " <> T.unpack (routeHandler r1)
+        , "  " <> show (routeMethod r2) <> " " <> showPattern (routePattern r2)
+        , "    -> " <> T.unpack (routeHandler r2)
+        ]
+    exitFailure
+
+-- | Extract route specs from a RouteT for analysis
+class HasRouteSpecs route where
+  extractRouteSpecs :: route -> [RouteSpec]
+
+-- | Automatically extract specs from combined routes
+instance (HasRouteSpecs a, HasRouteSpecs b) => HasRouteSpecs (a :<|> b) where
+  extractRouteSpecs (a :<|> b) = extractRouteSpecs a <> extractRouteSpecs b
+
+-- | Validate at server startup
+runServerWithValidation :: Backend b
+                        => BackendConfig b
+                        -> RouteT ServerError IO Response
+                        -> IO ()
+runServerWithValidation config route = do
+  validateRoutesOrFail (extractRouteSpecs route)
+  runServer config route
+
+-- | Development mode: log warnings but don't fail
+validateRoutesWithWarnings :: MonadIO m => [RouteSpec] -> m ()
+validateRoutesWithWarnings routes = do
+  let analysis = analyzeRoutes routes
+  forM_ (analysisWarnings analysis) $ \warning ->
+    liftIO $ hPutStrLn stderr $ "WARNING: " <> T.unpack warning
+  forM_ (analysisShadowed analysis) $ \(shadowed, by) ->
+    liftIO $ hPutStrLn stderr $ unlines
+      [ "WARNING: Route may be shadowed:"
+      , "  " <> showRoute shadowed
+      , "  is shadowed by:"
+      , "  " <> showRoute by
+      ]
+```
+
+### 8.10 Route Trie for Efficient Matching
+
+The route analysis builds a trie structure that can also be used for efficient
+runtime matching (when TH optimization isn't available):
+
+```haskell
+-- | Route trie for O(path length) matching
+data RouteTrie a = RouteTrie
+  { trieHandlers  :: !(HashMap Method a)           -- Handlers at this node
+  , trieStatic    :: !(HashMap Text (RouteTrie a)) -- Static children
+  , trieCapture   :: !(Maybe (TypeRep, RouteTrie a)) -- Capture child
+  , trieWildcard  :: !(Maybe a)                    -- Wildcard handler
+  }
+
+-- | Build a trie from route specs
+buildRouteTrie :: [(RouteSpec, a)] -> RouteTrie a
+buildRouteTrie = foldr insertRoute emptyTrie
+
+-- | Match a request against the trie
+matchTrie :: RouteTrie a -> Method -> [Text] -> Maybe (a, Captures)
+matchTrie trie method = go trie []
+  where
+    go (RouteTrie handlers static capture wildcard) caps = \case
+      [] -> (,caps) <$> Map.lookup method handlers
+      (seg:rest) ->
+        -- Try static match first (more specific)
+        (Map.lookup seg static >>= \t -> go t caps rest)
+        -- Then try capture
+        <|> (capture >>= \(_, t) -> go t ((seg, undefined):caps) rest)
+        -- Finally try wildcard
+        <|> ((,caps) <$> wildcard)
 ```
 
 ---
@@ -1637,9 +1928,417 @@ renderTrace trace = T.unlines $
 
 ---
 
-## Part 13: Running Routes
+## Part 13: OpenTelemetry Tracing
 
-### 13.1 HAI Integration
+Hermes provides first-class [OpenTelemetry](https://opentelemetry.io/) integration following
+the [HTTP semantic conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/).
+Tracing is built into the framework rather than bolted on as middleware, enabling:
+- Accurate `http.route` attributes (from the routing layer)
+- Proper span parenting through async operations
+- Automatic context propagation
+- Integration with the Webmachine decision tree
+
+### 13.1 HTTP Server Spans
+
+Following the [OTel HTTP server span conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/):
+
+```haskell
+-- | OpenTelemetry span attributes for HTTP servers
+data HTTPServerSpanAttributes = HTTPServerSpanAttributes
+  { -- Required attributes
+    httpRequestMethod     :: !Method              -- http.request.method
+  , urlScheme             :: !Text                -- url.scheme (http/https)
+  , urlPath               :: !Text                -- url.path
+
+    -- Conditionally required
+  , httpRoute             :: !(Maybe Text)        -- http.route (MUST be low cardinality!)
+  , httpResponseStatusCode :: !(Maybe StatusCode) -- http.response.status_code
+  , errorType             :: !(Maybe Text)        -- error.type (on errors)
+
+    -- Recommended
+  , serverAddress         :: !(Maybe Text)        -- server.address
+  , serverPort            :: !(Maybe Int)         -- server.port
+  , urlQuery              :: !(Maybe Text)        -- url.query (sanitized!)
+  , userAgentOriginal     :: !(Maybe Text)        -- user_agent.original
+  , clientAddress         :: !(Maybe Text)        -- client.address
+  , clientPort            :: !(Maybe Int)         -- client.port
+
+    -- Network attributes
+  , networkProtocolName   :: !(Maybe Text)        -- network.protocol.name
+  , networkProtocolVersion :: !(Maybe Text)       -- network.protocol.version
+  }
+
+-- | Span naming follows OTel conventions: "{method} {route}" or just "{method}"
+spanName :: HTTPServerSpanAttributes -> Text
+spanName attrs = case httpRoute attrs of
+  Just route -> T.unwords [renderMethod (httpRequestMethod attrs), route]
+  Nothing    -> renderMethod (httpRequestMethod attrs)
+
+-- | Extract span attributes from HAI Request
+extractServerSpanAttributes :: Request -> HTTPServerSpanAttributes
+extractServerSpanAttributes req = HTTPServerSpanAttributes
+  { httpRequestMethod = requestMethod req
+  , urlScheme = if requestIsSecure req then "https" else "http"
+  , urlPath = pathRaw (requestPath req)
+  , httpRoute = Nothing  -- Set by routing layer!
+  , httpResponseStatusCode = Nothing  -- Set after response
+  , errorType = Nothing
+  , serverAddress = Nothing  -- From Host header
+  , serverPort = Nothing
+  , urlQuery = Just $ queryRaw (requestQueryString req)
+  , userAgentOriginal = getHeaderText @UserAgent req
+  , clientAddress = Just $ renderSockAddr (requestRemoteHost req)
+  , clientPort = sockAddrPort (requestRemoteHost req)
+  , networkProtocolName = Just "http"
+  , networkProtocolVersion = Just $ renderHTTPVersion (requestHttpVersion req)
+  }
+```
+
+### 13.2 Route-Aware Tracing
+
+The key advantage of framework-integrated tracing is access to `http.route`:
+
+```haskell
+-- | Tracing context carried through routing
+data TracingContext = TracingContext
+  { tcSpan        :: !Span                    -- Current span
+  , tcRoute       :: !(IORef (Maybe Text))    -- Route pattern (set by routing)
+  , tcAttributes  :: !(IORef [(Text, AttributeValue)]) -- Additional attributes
+  }
+
+-- | Middleware that creates the server span
+withServerSpan :: Tracer -> Middleware
+withServerSpan tracer app req respond = do
+  let attrs = extractServerSpanAttributes req
+      initialName = spanName attrs  -- Just method initially
+
+  inSpan tracer initialName (spanOpts attrs) $ \span -> do
+    -- Create mutable route ref - routing layer will fill this in
+    routeRef <- newIORef Nothing
+    attrsRef <- newIORef []
+
+    let ctx = TracingContext span routeRef attrsRef
+        req' = req { requestTracingContext = Just ctx }
+
+    app req' $ \resp -> do
+      -- Update span with final attributes
+      mRoute <- readIORef routeRef
+      extraAttrs <- readIORef attrsRef
+
+      -- Update span name if we have a route
+      forM_ mRoute $ \route -> do
+        updateSpanName span (renderMethod (httpRequestMethod attrs) <> " " <> route)
+        setAttributes span [("http.route", toAttribute route)]
+
+      -- Set response attributes
+      setAttributes span $
+        [ ("http.response.status_code", toAttribute $ statusCodeInt $ responseStatus resp)
+        ] <> extraAttrs
+
+      -- Set error status if applicable
+      when (isErrorStatus $ responseStatus resp) $
+        setStatus span (Error $ statusMessage $ responseStatus resp)
+
+      respond resp
+
+  where
+    spanOpts attrs = defaultSpanArguments
+      { kind = Server
+      , attributes = toOTelAttributes attrs
+      }
+
+-- | Route directive that records the matched route pattern
+recordRoute :: Text -> RouteT e m ()
+recordRoute pattern = RouteT $ \ctx -> do
+  -- Record the route pattern for tracing
+  forM_ (requestTracingContext $ rcRequest ctx) $ \tc ->
+    writeIORef (tcRoute tc) (Just pattern)
+  pure $ Matched ()
+
+-- | Path matching that automatically records the route
+pathWithTrace :: Text -> RouteT e m a -> RouteT e m a
+pathWithTrace segment inner = do
+  path segment
+  recordRouteSegment segment
+  inner
+```
+
+### 13.3 Client Span Support
+
+```haskell
+-- | HTTP client span attributes
+data HTTPClientSpanAttributes = HTTPClientSpanAttributes
+  { clientHttpRequestMethod :: !Method        -- http.request.method
+  , clientUrlFull           :: !Text          -- url.full
+  , clientServerAddress     :: !Text          -- server.address
+  , clientServerPort        :: !Int           -- server.port
+  , clientHttpResponseStatus :: !(Maybe StatusCode)
+  , clientErrorType         :: !(Maybe Text)
+  }
+
+-- | Client middleware for outgoing requests
+withClientSpan :: Tracer -> ClientMiddleware
+withClientSpan tracer makeRequest req = do
+  let attrs = extractClientAttrs req
+      name = renderMethod (clientHttpRequestMethod attrs)
+
+  inSpan tracer name (clientSpanOpts attrs) $ \span -> do
+    -- Inject trace context into request headers
+    ctx <- getContext
+    req' <- injectContext ctx req
+
+    -- Make the request
+    resp <- makeRequest req'
+
+    -- Record response
+    setAttributes span
+      [ ("http.response.status_code", toAttribute $ statusCodeInt $ responseStatus resp)
+      ]
+
+    when (isErrorStatus $ responseStatus resp) $
+      setStatus span (Error "HTTP error")
+
+    pure resp
+
+-- | Inject W3C Trace Context headers
+injectContext :: Context -> Request -> IO Request
+injectContext ctx req = do
+  let headers = requestHeaders req
+      traceparent = renderTraceparent (spanContext $ getSpan ctx)
+      tracestate = renderTracestate ctx
+  pure $ req
+    { requestHeaders = setHeader (TraceparentHeader traceparent) $
+                       setHeader (TracestateHeader tracestate) headers
+    }
+```
+
+### 13.4 Integration with Webmachine Decision Tree
+
+The decision tree provides natural tracing points:
+
+```haskell
+-- | Traced resource with automatic span events
+data TracedResource m = TracedResource
+  { tracedResource :: Resource m
+  , resourceTracer :: Tracer
+  }
+
+-- | Run resource with decision tracing
+runTracedResource :: MonadIO m => TracedResource m -> Request -> m Response
+runTracedResource TracedResource{..} req = do
+  let span = getSpanFromRequest req
+
+  -- Add span events for each decision point
+  addEvent span "http.decision.service_available"
+  available <- resourceServiceAvailable tracedResource
+  setAttributes span [("hermes.decision.service_available", toAttribute available)]
+
+  unless available $ do
+    addEvent span "http.decision.rejected" [("reason", "service_unavailable")]
+    pure $ responseServiceUnavailable
+
+  addEvent span "http.decision.method_check"
+  -- ... continue through decision tree
+
+  -- Final response
+  addEvent span "http.decision.complete"
+  resp <- generateResponse
+  pure resp
+
+-- | Lifecycle hooks that emit trace events
+tracingHooks :: Tracer -> LifecycleHooks m
+tracingHooks tracer = LifecycleHooks
+  { hookAfterServiceCheck = \req result -> do
+      let span = getSpanFromRequest req
+      addEvent span "hermes.service_check" [("result", toAttribute result)]
+
+  , hookAfterMethodCheck = \req result -> do
+      let span = getSpanFromRequest req
+      addEvent span "hermes.method_check"
+        [ ("result", toAttribute result)
+        , ("method", toAttribute $ requestMethod req)
+        ]
+
+  , hookAfterAuth = \req result -> do
+      let span = getSpanFromRequest req
+      addEvent span "hermes.auth_check"
+        [("result", toAttribute $ show result)]
+      -- Don't log sensitive auth details!
+
+  , hookAfterContentNeg = \req mMediaType -> do
+      let span = getSpanFromRequest req
+      forM_ mMediaType $ \mt ->
+        setAttributes span [("http.response.content_type", toAttribute $ renderMediaType mt)]
+
+  , hookOnError = \req ex -> do
+      let span = getSpanFromRequest req
+      recordException span ex
+      setStatus span (Error $ T.pack $ show ex)
+      pure $ responseInternalError
+  }
+```
+
+### 13.5 Context Propagation
+
+```haskell
+-- | W3C Trace Context headers (RFC trace-context)
+newtype TraceparentHeader = TraceparentHeader Text
+  deriving (Eq, Show)
+
+instance KnownHeader TraceparentHeader where
+  type ParseFailure TraceparentHeader = Text
+  type Cardinality TraceparentHeader = 'ZeroOrOne
+  type Direction TraceparentHeader = 'Request
+  headerName _ = "traceparent"
+  parseFromHeaders _ (bs :| _) = parseTraceparent (decodeUtf8 bs)
+  renderToHeaders _ (TraceparentHeader t) = encodeUtf8 t
+
+newtype TracestateHeader = TracestateHeader Text
+  deriving (Eq, Show)
+
+instance KnownHeader TracestateHeader where
+  type ParseFailure TracestateHeader = Text
+  type Cardinality TracestateHeader = 'ZeroOrOne
+  type Direction TracestateHeader = 'Request
+  headerName _ = "tracestate"
+  parseFromHeaders _ (bs :| _) = Right $ TracestateHeader $ decodeUtf8 bs
+  renderToHeaders _ (TracestateHeader t) = encodeUtf8 t
+
+-- | Extract parent context from incoming request
+extractParentContext :: Request -> IO (Maybe SpanContext)
+extractParentContext req = do
+  case getRequestHeader @TraceparentHeader req of
+    Right (Just (TraceparentHeader tp)) -> parseTraceparent tp
+    _ -> pure Nothing
+
+-- | Automatic context propagation middleware
+contextPropagationMiddleware :: Middleware
+contextPropagationMiddleware app req respond = do
+  mParentCtx <- extractParentContext req
+  case mParentCtx of
+    Nothing -> app req respond  -- No parent, create root span
+    Just parentCtx -> do
+      -- Set parent context for child span creation
+      withParentContext parentCtx $
+        app req respond
+```
+
+### 13.6 Metrics Integration
+
+Following [OTel HTTP metrics conventions](https://opentelemetry.io/docs/specs/semconv/http/http-metrics/):
+
+```haskell
+-- | HTTP server metrics
+data HTTPServerMetrics = HTTPServerMetrics
+  { requestDuration :: !Histogram   -- http.server.request.duration
+  , activeRequests  :: !UpDownCounter -- http.server.active_requests
+  , requestSize     :: !Histogram   -- http.server.request.body.size
+  , responseSize    :: !Histogram   -- http.server.response.body.size
+  }
+
+-- | Create metrics with standard names
+mkHTTPServerMetrics :: Meter -> IO HTTPServerMetrics
+mkHTTPServerMetrics meter = HTTPServerMetrics
+  <$> createHistogram meter "http.server.request.duration"
+        (histogramOpts { unit = Just "s", description = Just "Duration of HTTP server requests" })
+  <*> createUpDownCounter meter "http.server.active_requests"
+        (counterOpts { description = Just "Number of active HTTP server requests" })
+  <*> createHistogram meter "http.server.request.body.size"
+        (histogramOpts { unit = Just "By" })
+  <*> createHistogram meter "http.server.response.body.size"
+        (histogramOpts { unit = Just "By" })
+
+-- | Metrics middleware
+metricsMiddleware :: HTTPServerMetrics -> Middleware
+metricsMiddleware metrics app req respond = do
+  -- Track active requests
+  add (activeRequests metrics) 1 (requestAttrs req)
+
+  start <- getCurrentTime
+  app req $ \resp -> do
+    end <- getCurrentTime
+    let duration = realToFrac $ diffUTCTime end start
+
+    -- Record metrics
+    record (requestDuration metrics) duration (responseAttrs req resp)
+    add (activeRequests metrics) (-1) (requestAttrs req)
+
+    forM_ (requestBodyLength req) $ \len ->
+      record (requestSize metrics) (fromIntegral len) (requestAttrs req)
+
+    forM_ (getResponseBodyLength resp) $ \len ->
+      record (responseSize metrics) (fromIntegral len) (responseAttrs req resp)
+
+    respond resp
+
+  where
+    requestAttrs req =
+      [ ("http.request.method", toAttribute $ requestMethod req)
+      , ("url.scheme", toAttribute $ if requestIsSecure req then "https" else "http")
+      ]
+    responseAttrs req resp = requestAttrs req <>
+      [ ("http.response.status_code", toAttribute $ statusCodeInt $ responseStatus resp)
+      , ("http.route", maybe "" id $ getMatchedRoute req)
+      ]
+```
+
+### 13.7 Configuration
+
+```haskell
+-- | OTel configuration for Hermes
+data OTelConfig = OTelConfig
+  { otelServiceName    :: !Text           -- service.name
+  , otelServiceVersion :: !(Maybe Text)   -- service.version
+  , otelEnvironment    :: !(Maybe Text)   -- deployment.environment
+  , otelTracerProvider :: !TracerProvider
+  , otelMeterProvider  :: !MeterProvider
+  , otelPropagators    :: ![Propagator]   -- Context propagators
+  , otelSampler        :: !Sampler        -- Sampling strategy
+  }
+
+-- | Default OTel config with sensible defaults
+defaultOTelConfig :: IO OTelConfig
+defaultOTelConfig = do
+  -- Respect OTEL_* environment variables
+  serviceName <- fromMaybe "hermes" <$> lookupEnv "OTEL_SERVICE_NAME"
+  tracerProvider <- initTracerProvider
+  meterProvider <- initMeterProvider
+  pure OTelConfig
+    { otelServiceName = T.pack serviceName
+    , otelServiceVersion = Nothing
+    , otelEnvironment = Nothing
+    , otelTracerProvider = tracerProvider
+    , otelMeterProvider = meterProvider
+    , otelPropagators = [w3cTraceContext, w3cBaggage]
+    , otelSampler = parentBasedSampler alwaysOn
+    }
+
+-- | Run server with full OTel instrumentation
+runServerWithOTel :: Backend b
+                  => OTelConfig
+                  -> BackendConfig b
+                  -> RouteT ServerError IO Response
+                  -> IO ()
+runServerWithOTel config backendConfig routes = do
+  let tracer = makeTracer (otelTracerProvider config) "hermes"
+      meter = makeMeter (otelMeterProvider config) "hermes"
+
+  metrics <- mkHTTPServerMetrics meter
+
+  let app = toHAIApplication routes
+      instrumented = withServerSpan tracer
+                   . metricsMiddleware metrics
+                   . contextPropagationMiddleware
+                   $ app
+
+  runBackend backendConfig instrumented
+```
+
+---
+
+## Part 14: Running Routes
+
+### 14.1 HAI Integration
 
 ```haskell
 -- | Convert a route to a HAI Application
@@ -1694,9 +2393,9 @@ rejectionResponse = \case
 
 ---
 
-## Part 14: Testing Support
+## Part 15: Testing Support
 
-### 14.1 Route Testing DSL
+### 15.1 Route Testing DSL
 
 ```haskell
 -- | Test context
@@ -1732,7 +2431,7 @@ shouldReject (Rejected _) = pure ()
 shouldReject result = expectationFailure $ "Expected Rejected, got: " <> show result
 ```
 
-### 14.2 Property-Based Testing
+### 15.2 Property-Based Testing
 
 ```haskell
 -- | Generate valid paths for an API type
@@ -1753,7 +2452,7 @@ prop_clientServerRoundTrip server = property $ do
 
 ---
 
-## Part 15: Implementation Phases
+## Part 16: Implementation Phases
 
 ### Phase 1: HAI Core & Backend Abstraction
 - [ ] Define HAI `Request` type with `HeaderMap`, interned `Method`, efficient `Path`
@@ -1769,6 +2468,9 @@ prop_clientServerRoundTrip server = property $ do
 - [ ] Method matching using Hermes `Method` type
 - [ ] Route composition (`<|>`, `</>`)
 - [ ] Integration with HAI `Application` type
+- [ ] Runtime route overlap detection (`RouteSpec`, `RouteAnalysis`)
+- [ ] Route trie construction for efficient matching
+- [ ] Startup validation with `runServerWithValidation`
 
 ### Phase 3: Header & Body Integration
 - [ ] Header directives with `KnownHeader` and direction checking
@@ -1800,10 +2502,14 @@ prop_clientServerRoundTrip server = property $ do
 - [ ] Content negotiation engine (RFC 7231)
 - [ ] Decision tree tracing/visualization
 
-### Phase 7: Type-Level API
+### Phase 7: Type-Level API & Record-Based Routes
 - [ ] Type-level combinators (`:>`, `:<|>`, `Capture`, etc.)
 - [ ] Server derivation via type classes
 - [ ] Client derivation
+- [ ] Record-based routes (`NamedRoutes`, `GenericMode`)
+- [ ] `(:-`) operator and `RouteMode` type
+- [ ] `genericServer` and `genericClient` derivation
+- [ ] Nested route composition with records
 - [ ] OpenAPI/Swagger generation
 - [ ] Integration with TH for hybrid approach
 
@@ -1814,13 +2520,23 @@ prop_clientServerRoundTrip server = property $ do
 - [ ] Common middleware (logging, CORS, compression, rate limiting)
 - [ ] Error handling refinement
 
-### Phase 9: Additional Backends
+### Phase 9: OpenTelemetry Integration
+- [ ] HTTP server span support with all [semantic conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/)
+- [ ] `http.route` attribute from routing layer
+- [ ] HTTP client span support
+- [ ] W3C Trace Context propagation (`traceparent`, `tracestate`)
+- [ ] Integration with Webmachine lifecycle hooks
+- [ ] HTTP metrics (`http.server.request.duration`, etc.)
+- [ ] `runServerWithOTel` convenience function
+- [ ] Environment variable configuration (`OTEL_*`)
+
+### Phase 10: Additional Backends
 - [ ] HTTP/2 backend support
 - [ ] QUIC/HTTP/3 backend (experimental)
 - [ ] Unix socket backend
 - [ ] In-memory backend for testing
 
-### Phase 10: Documentation & Polish
+### Phase 11: Documentation & Polish
 - [ ] Tutorial documentation
 - [ ] API reference
 - [ ] Example applications (REST API, WebSocket, SSE)
@@ -1829,7 +2545,7 @@ prop_clientServerRoundTrip server = property $ do
 
 ---
 
-## Part 16: Example Application
+## Part 17: Example Application
 
 ```haskell
 {-# LANGUAGE DataKinds #-}
@@ -1923,7 +2639,7 @@ userResourceWebmachine userId = defaultResource
 
 | Feature | Akka HTTP | Servant | Webmachine | Hermes (Proposed) |
 |---------|-----------|---------|------------|-------------------|
-| Route Definition | Runtime DSL | Type-level | Resource callbacks | All three |
+| Route Definition | Runtime DSL | Type-level | Resource callbacks | All three + Records |
 | Type Safety | Moderate | Maximum | Low | High |
 | Error Messages | Good | Complex | Good | Good (TH-enhanced) |
 | Client Generation | Manual | Automatic | N/A | Automatic |
@@ -1938,6 +2654,9 @@ userResourceWebmachine userId = defaultResource
 | Header Type Safety | Limited | Good | None | Excellent |
 | Template Haskell | No | No | N/A | Yes |
 | Decision Tree | No | No | Yes | Yes |
+| Record-Based Routes | No | Yes (NamedRoutes) | No | Yes |
+| Route Overlap Detection | No | Type errors | N/A | TH + Runtime |
+| OpenTelemetry | Manual | Manual | Manual | Built-in |
 
 ---
 
@@ -1968,6 +2687,11 @@ dependencies:
   # Template Haskell
   - template-haskell # TH for route generation
   - th-lift          # TH lifting utilities
+
+  # OpenTelemetry
+  - hs-opentelemetry-api          # OTel API
+  - hs-opentelemetry-sdk          # OTel SDK
+  - hs-opentelemetry-propagator-w3c # W3C Trace Context
 
   # Optional future backends
   - http2            # HTTP/2 support (future)
@@ -2000,6 +2724,8 @@ hermes/
 │   │   │   ├── Header.hs             -- Header extraction
 │   │   │   ├── Body.hs               -- Body handling
 │   │   │   ├── Query.hs              -- Query parameters
+│   │   │   ├── Analysis.hs           -- Route overlap detection
+│   │   │   ├── Trie.hs               -- Route trie for matching
 │   │   │   └── TH.hs                 -- Template Haskell support
 │   │   │
 │   │   ├── Resource.hs               -- Webmachine-style resources
@@ -2014,7 +2740,15 @@ hermes/
 │   │   │   ├── Combinators.hs        -- :>, :<|>, etc.
 │   │   │   ├── Server.hs             -- Server derivation
 │   │   │   ├── Client.hs             -- Client derivation
+│   │   │   ├── Generic.hs            -- Record-based routes (NamedRoutes)
 │   │   │   └── OpenAPI.hs            -- OpenAPI generation
+│   │   │
+│   │   ├── Telemetry.hs              -- OpenTelemetry integration
+│   │   ├── Telemetry/
+│   │   │   ├── Tracing.hs            -- HTTP server/client spans
+│   │   │   ├── Metrics.hs            -- HTTP metrics
+│   │   │   ├── Propagation.hs        -- W3C Trace Context
+│   │   │   └── Attributes.hs         -- OTel semantic conventions
 │   │   │
 │   │   └── Test.hs                   -- Testing utilities
 │   │
@@ -2030,13 +2764,25 @@ hermes/
 
 ## References
 
+### Frameworks & Libraries
 - [Akka HTTP Routing DSL](https://doc.akka.io/docs/akka-http/current/routing-dsl/overview.html)
 - [Akka HTTP Directives](https://doc.akka.io/docs/akka-http/current/routing-dsl/directives/index.html)
 - [Servant Documentation](https://www.servant.dev/)
+- [Servant NamedRoutes](https://www.tweag.io/blog/2022-02-24-named-routes/) - Record-based API definition
+- [Servant.API.Generic](https://hackage.haskell.org/package/servant/docs/Servant-API-Generic.html)
 - [Type-level Web APIs with Servant (Paper)](https://www.andres-loeh.de/Servant/servant-wgp.pdf)
 - [Webmachine](https://github.com/webmachine/webmachine) - Erlang HTTP semantic framework
 - [Webmachine Decision Diagram](https://raw.githubusercontent.com/webmachine/webmachine/develop/docs/http-headers-status-v3.png)
 - [WAI Interface](https://hackage.haskell.org/package/wai)
+
+### OpenTelemetry
+- [OpenTelemetry](https://opentelemetry.io/) - Observability framework
+- [OTel HTTP Semantic Conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/) - HTTP span attributes
+- [OTel HTTP Metrics Conventions](https://opentelemetry.io/docs/specs/semconv/http/http-metrics/) - HTTP metrics
+- [W3C Trace Context](https://www.w3.org/TR/trace-context/) - Distributed tracing propagation
+- [hs-opentelemetry](https://hackage.haskell.org/package/hs-opentelemetry-api) - Haskell OTel bindings
+
+### HTTP RFCs
 - [RFC 9110 - HTTP Semantics](https://datatracker.ietf.org/doc/html/rfc9110)
 - [RFC 7232 - Conditional Requests](https://datatracker.ietf.org/doc/html/rfc7232)
 - [RFC 7231 - HTTP/1.1 Semantics and Content](https://datatracker.ietf.org/doc/html/rfc7231)
