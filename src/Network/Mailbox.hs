@@ -1,8 +1,9 @@
 {-# LANGUAGE TemplateHaskell #-}
--- | Email address (mailbox) parsing per RFC 5322.
+-- | Email address (mailbox) parsing per RFC 5322 with IDN support.
 --
 -- This module provides types and parsers for Internet email addresses
--- as defined in RFC 5322 (Internet Message Format).
+-- as defined in RFC 5322 (Internet Message Format), with support for
+-- Internationalized Domain Names (IDN) per RFC 5891 (IDNA2008).
 --
 -- The grammar for a mailbox is:
 --
@@ -15,6 +16,11 @@
 -- local-part      =   dot-atom / quoted-string
 -- domain          =   dot-atom / domain-literal
 -- @
+--
+-- For internationalized domains (e.g., @münchen.de@), we support both:
+--
+-- * Unicode form for display: @user\@münchen.de@
+-- * ASCII (Punycode) form for transmission: @user\@xn--mnchen-3ya.de@
 module Network.Mailbox
   ( -- * Types
     Mailbox (..)
@@ -29,6 +35,16 @@ module Network.Mailbox
     -- * Rendering
   , renderMailbox
   , renderAddrSpec
+  , renderMailboxUnicode
+  , renderAddrSpecUnicode
+    -- * IDN Conversion
+  , domainToASCII
+  , domainToUnicode
+  , mkDomainFromUnicode
+  , addrSpecToASCII
+  , addrSpecToUnicode
+  , mailboxToASCII
+  , mailboxToUnicode
   ) where
 
 import Control.Applicative (optional)
@@ -44,12 +60,15 @@ import qualified Mason.Builder as M
 import Network.HTTP.Headers.Parsing.Util
 import Network.HTTP.Headers.Rendering.Util (shortText)
 
+import qualified Data.Text.IDN as IDN
+
 -- | A complete mailbox, which may include a display name.
 --
 -- Examples:
 --
 -- * @john\@example.com@ (addr-spec only)
 -- * @John Doe \<john\@example.com\>@ (with display name)
+-- * @user\@münchen.de@ (with internationalized domain)
 data Mailbox = Mailbox
   { mailboxDisplayName :: !(Maybe Text)
   -- ^ Optional display name (e.g., "John Doe")
@@ -84,9 +103,19 @@ data LocalPart
 --
 -- Can be either a domain name (e.g., @example.com@) or a domain literal
 -- (e.g., @[192.168.1.1]@).
+--
+-- For internationalized domains, we store both the ASCII (Punycode) form
+-- and the Unicode form when they differ:
+--
+-- * @DomainName "xn--mnchen-3ya.de" (Just "münchen.de")@ - IDN domain
+-- * @DomainName "example.com" Nothing@ - ASCII-only domain
 data Domain
-  = DomainName !ShortText
-  -- ^ A domain name (e.g., @example.com@)
+  = DomainName
+      { domainASCII :: !ShortText
+      -- ^ The ASCII (A-label/Punycode) form, safe for transmission
+      , domainUnicode :: !(Maybe Text)
+      -- ^ The Unicode (U-label) form, if different from ASCII
+      }
   | DomainLiteral !ShortText
   -- ^ A domain literal (e.g., @[192.168.1.1]@)
   deriving stock (Eq, Show)
@@ -97,7 +126,7 @@ parseMailbox bs = case runParser mailboxParser bs of
   OK mailbox "" -> Right mailbox
   OK _ rest -> Left $ "Unconsumed input after parsing mailbox: " <> show rest
   Fail -> Left "Failed to parse mailbox"
-  Err err -> Left err
+  Err e -> Left e
 
 -- | Parse an addr-spec from a ByteString.
 parseAddrSpec :: ByteString -> Either String AddrSpec
@@ -105,7 +134,7 @@ parseAddrSpec bs = case runParser addrSpecParser bs of
   OK addr "" -> Right addr
   OK _ rest -> Left $ "Unconsumed input after parsing addr-spec: " <> show rest
   Fail -> Left "Failed to parse addr-spec"
-  Err err -> Left err
+  Err e -> Left e
 
 -- | Character set for atext (atom text) per RFC 5322.
 --
@@ -256,10 +285,21 @@ quotedStringParser = do
 -- @
 -- domain = dot-atom / domain-literal
 -- @
+--
+-- This parser accepts both ASCII domains and Punycode-encoded IDN domains.
+-- For pure ASCII domains, Unicode form is not stored.
+-- For Punycode domains (starting with xn--), we decode to Unicode.
 domainParser :: ParserT st String Domain
 domainParser = domainLiteralParser <|> domainNameParser
   where
-    domainNameParser = DomainName <$> domainDotAtomParser
+    domainNameParser = do
+      ascii <- domainDotAtomParser
+      let asciiText = ST.toText ascii
+      -- Try to decode as Punycode to get Unicode form
+      let unicodeForm = case IDN.toUnicode asciiText of
+            Right unicode | unicode /= asciiText -> Just unicode
+            _ -> Nothing
+      pure $ DomainName ascii unicodeForm
     domainLiteralParser = DomainLiteral <$> domainLiteralParser'
 
 -- | Parse a domain name (dot-atom for domains).
@@ -299,7 +339,70 @@ domainLiteralParser' = do
 cfws :: ParserT st e ()
 cfws = ows
 
--- | Render a mailbox to a Builder.
+-------------------------------------------------------------------------------
+-- IDN Conversion Functions
+-------------------------------------------------------------------------------
+
+-- | Convert a domain to its ASCII (Punycode) form.
+--
+-- Returns the ASCII form suitable for transmission over the wire.
+-- For domain literals, returns as-is.
+domainToASCII :: Domain -> ShortText
+domainToASCII (DomainName ascii _) = ascii
+domainToASCII (DomainLiteral lit) = lit
+
+-- | Convert a domain to its Unicode form for display.
+--
+-- Returns the Unicode form if available, otherwise the ASCII form.
+-- For domain literals, returns as-is.
+domainToUnicode :: Domain -> Text
+domainToUnicode (DomainName ascii mUnicode) =
+  case mUnicode of
+    Just unicode -> unicode
+    Nothing -> ST.toText ascii
+domainToUnicode (DomainLiteral lit) = ST.toText lit
+
+-- | Convert an addr-spec to use ASCII domain (for transmission).
+addrSpecToASCII :: AddrSpec -> AddrSpec
+addrSpecToASCII addr@(AddrSpec _ (DomainLiteral _)) = addr
+addrSpecToASCII (AddrSpec local (DomainName ascii _)) =
+  AddrSpec local (DomainName ascii Nothing)
+
+-- | Try to convert a Unicode domain to its ASCII form and create an AddrSpec.
+--
+-- This is useful when you have a Unicode email address and need to convert
+-- it for transmission.
+addrSpecToUnicode :: AddrSpec -> AddrSpec
+addrSpecToUnicode = id  -- Already stores Unicode form if available
+
+-- | Convert a mailbox to use ASCII domain (for transmission).
+mailboxToASCII :: Mailbox -> Mailbox
+mailboxToASCII (Mailbox displayName addr) =
+  Mailbox displayName (addrSpecToASCII addr)
+
+-- | Convert a mailbox, keeping Unicode domain form.
+mailboxToUnicode :: Mailbox -> Mailbox
+mailboxToUnicode = id  -- Already stores Unicode form if available
+
+-- | Create a domain from a Unicode text, converting to ASCII (Punycode) form.
+--
+-- This handles internationalized domain names like @münchen.de@.
+mkDomainFromUnicode :: Text -> Either String Domain
+mkDomainFromUnicode txt = case IDN.toASCII txt of
+  Left e -> Left $ "Invalid internationalized domain name: " <> show e
+  Right ascii ->
+    let asciiShort = ST.fromText ascii
+        -- Store Unicode form only if different from ASCII
+        unicodeForm = if ascii == txt then Nothing else Just txt
+    in Right $ DomainName asciiShort unicodeForm
+
+-------------------------------------------------------------------------------
+-- Rendering Functions
+-------------------------------------------------------------------------------
+
+-- | Render a mailbox to a Builder (uses ASCII/Punycode domain).
+--
+-- This produces output safe for transmission over the wire.
 renderMailbox :: Mailbox -> M.Builder
 renderMailbox (Mailbox mDisplayName addrSpec) = case mDisplayName of
   Nothing -> renderAddrSpec addrSpec
@@ -318,10 +421,36 @@ renderMailbox (Mailbox mDisplayName addrSpec) = case mDisplayName of
     escapeChar '\\' = "\\\\"
     escapeChar c = T.singleton c
 
--- | Render an addr-spec to a Builder.
+-- | Render a mailbox with Unicode domain (for display to users).
+renderMailboxUnicode :: Mailbox -> M.Builder
+renderMailboxUnicode (Mailbox mDisplayName addrSpec) = case mDisplayName of
+  Nothing -> renderAddrSpecUnicode addrSpec
+  Just displayName ->
+    renderDisplayName displayName <> " <" <> renderAddrSpecUnicode addrSpec <> ">"
+  where
+    renderDisplayName name
+      | T.any needsQuoting name = "\"" <> escapeQuoted name <> "\""
+      | otherwise = M.textUtf8 name
+
+    needsQuoting c = c == '"' || c == '\\' || c == '<' || c == '>' ||
+                     c == '@' || c == ',' || c == ';' || c == ':'
+
+    escapeQuoted = M.textUtf8 . T.concatMap escapeChar
+    escapeChar '"' = "\\\""
+    escapeChar '\\' = "\\\\"
+    escapeChar c = T.singleton c
+
+-- | Render an addr-spec to a Builder (uses ASCII/Punycode domain).
+--
+-- This produces output safe for transmission over the wire.
 renderAddrSpec :: AddrSpec -> M.Builder
 renderAddrSpec (AddrSpec localPart domain) =
   renderLocalPart localPart <> "@" <> renderDomain domain
+
+-- | Render an addr-spec with Unicode domain (for display to users).
+renderAddrSpecUnicode :: AddrSpec -> M.Builder
+renderAddrSpecUnicode (AddrSpec localPart domain) =
+  renderLocalPart localPart <> "@" <> renderDomainUnicode domain
 
 -- | Render a local part.
 renderLocalPart :: LocalPart -> M.Builder
@@ -333,7 +462,15 @@ renderLocalPart (LocalPartQuoted txt) = "\"" <> escapeQuoted txt <> "\""
     escapeChar '\\' = "\\\\"
     escapeChar c = T.singleton c
 
--- | Render a domain.
+-- | Render a domain (ASCII/Punycode form).
 renderDomain :: Domain -> M.Builder
-renderDomain (DomainName txt) = shortText txt
-renderDomain (DomainLiteral txt) = shortText txt
+renderDomain (DomainName ascii _) = shortText ascii
+renderDomain (DomainLiteral lit) = shortText lit
+
+-- | Render a domain (Unicode form for display).
+renderDomainUnicode :: Domain -> M.Builder
+renderDomainUnicode (DomainName ascii mUnicode) =
+  case mUnicode of
+    Just unicode -> M.textUtf8 unicode
+    Nothing -> shortText ascii
+renderDomainUnicode (DomainLiteral lit) = shortText lit
