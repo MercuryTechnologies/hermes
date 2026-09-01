@@ -30,7 +30,7 @@ import Data.MonoTraversable
 import Data.NonNull
 import qualified Data.HashMap.Strict as Map
 import Data.Kind
-import Data.List (partition)
+import Data.List (foldl', partition)
 import Data.List.NonEmpty (NonEmpty)
 import qualified Data.List.NonEmpty as NE
 import Data.Typeable
@@ -61,7 +61,7 @@ lookupRawHeader name (HeaderMap m) = fmap NE.reverse $ name `Map.lookup` m
 lookupHeader :: forall a. KnownHeader a => HeaderMap -> Either (ParseFailure a) (Maybe a)
 lookupHeader m = case lookupRawHeader (headerName $ Proxy @a) m of
   Nothing -> Right Nothing
-  Just entries -> case parseFromHeaders defaultHeaderSettings (NE.reverse entries) of
+  Just entries -> case parseFromHeaders defaultHeaderSettings entries of
     Left e -> Left e
     Right a -> Right $ Just a
 
@@ -90,9 +90,9 @@ setRawHeader name value (HeaderMap m) = HeaderMap $ Map.insert name (NE.reverse 
 -- This is the format used by the 'http-types' and 'wai', so it's useful for
 -- integrating with those libraries.
 headerMapFromList :: [(CI BS.ByteString, BS.ByteString)] -> HeaderMap
-headerMapFromList = foldr f (HeaderMap mempty)
+headerMapFromList = foldl' f (HeaderMap mempty)
   where
-    f (name, value) (HeaderMap m) = HeaderMap $ Map.alter g (unsafeUnknownHeaderFromBytestring $ foldedCase name) m
+    f (HeaderMap m) (name, value) = HeaderMap $ Map.alter g (unsafeUnknownHeaderFromBytestring $ foldedCase name) m
       where
         g Nothing = Just $ value NE.:| []
         g (Just (x NE.:| xs)) = Just $ value NE.:| (x : xs)
@@ -102,7 +102,7 @@ headerMapToList (HeaderMap m) = concatMap f $ Map.toList m
   where
     f (name, values) =
       let ciName = toCIByteString name
-      in map (\value -> (ciName, value)) $ NE.toList values
+      in map (\value -> (ciName, value)) $ NE.toList $ NE.reverse values
 
 data HeaderCardinality = ZeroOrOne | One | ZeroOrMore | OneOrMore
 data HeaderIsRequestOrResponse = Request | Response | RequestAndResponse
